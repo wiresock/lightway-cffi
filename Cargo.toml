@@ -1,0 +1,26 @@
+[package]
+name = "lightway-cffi"
+version = "0.1.0"
+edition = "2024"
+description = "C ABI shim over lightway-core (Rust) for C/C++ consumers (e.g. kp_pkf_client)."
+license = "AGPL-3.0-only"
+repository = "https://github.com/expressvpn/lightway-cffi"
+
+[lib]
+# cdylib: lightway_cffi.dll + import lib for dynamic linking
+# staticlib: lightway_cffi.lib for fully-static embedding
+# rlib: allow use as a Rust dep for tests / downstream Rust consumers
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+bytes = "1.6.0"
+lightway-core = { git = "https://github.com/expressvpn/lightway" }
+tracing = "0.1.40"
+
+[build-dependencies]
+cbindgen = "0.29"

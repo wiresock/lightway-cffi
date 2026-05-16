@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build (all crate types)
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+  check-header:
+    name: Header up-to-date check (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ubuntu-cargo-
+
+      - name: Build (regenerates include/lightway_cffi.h)
+        run: cargo build
+
+      - name: Verify header is unchanged
+        run: |
+          git diff --exit-code include/lightway_cffi.h || \
+            (echo "::error::include/lightway_cffi.h is out of date. Run 'cargo build' and commit the result." && exit 1)
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ubuntu-cargo-clippy-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ubuntu-cargo-
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
