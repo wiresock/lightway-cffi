@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use lightway_core::InsideIpConfig;
 
 /// Application state carried inside every `Connection<CffiAppState>`.
+#[derive(Default)]
 pub(crate) struct CffiAppState {
     /// The earliest time at which `conn.tick()` should next be called.
     /// Set by `schedule_tick_cb`; consumed (and reset) by `he_conn_nudge`.
@@ -23,15 +24,6 @@ pub(crate) struct CffiAppState {
 
     /// Inside IP config received from the server (populated by `CffiIpConfig`).
     pub(crate) ip_config: Option<InsideIpConfig>,
-}
-
-impl Default for CffiAppState {
-    fn default() -> Self {
-        Self {
-            next_tick: None,
-            ip_config: None,
-        }
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ unsafe impl Send for CffiExpresslaneCb {}
 unsafe impl Sync for CffiExpresslaneCb {}
 
 impl CffiExpresslaneCb {
-    pub(crate) fn new(
+    pub(crate) fn create(
         cb: he_expresslane_cb_t,
         conn_ptr: *mut he_conn_t,
         ctx: *mut std::ffi::c_void,

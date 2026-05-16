@@ -9,6 +9,7 @@
 // C-ABI naming uses snake_case types (he_return_code_t etc.) and SCREAMING_SNAKE
 // enum variants (HE_SUCCESS etc.) by convention — suppress Rust style lints.
 #![allow(non_camel_case_types, non_upper_case_globals, clippy::upper_case_acronyms)]
+#![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Arc;
@@ -332,7 +333,7 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     let ctx_builder = if client.ssl_ctx.enable_expresslane {
         let b = ctx_builder.with_expresslane();
         if let Some(el_cb) = client.ssl_ctx.expresslane_cb {
-            b.with_expresslane_cb(CffiExpresslaneCb::new(el_cb, conn_ptr, ctx))
+            b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx))
         } else {
             b
         }
@@ -1144,7 +1145,7 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
         let Some(ref mut connection) = client.connection else {
             return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
         };
-        let should_tick = connection.app_state().next_tick.map_or(true, |t| now >= t);
+        let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
         if should_tick {
             connection.app_state_mut().next_tick = None;
             match connection.tick(TickType::ConnectionTick) {
