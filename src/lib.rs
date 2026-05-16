@@ -9,7 +9,6 @@
 // C-ABI naming uses snake_case types (he_return_code_t etc.) and SCREAMING_SNAKE
 // enum variants (HE_SUCCESS etc.) by convention — suppress Rust style lints.
 #![allow(non_camel_case_types, non_upper_case_globals, clippy::upper_case_acronyms)]
-#![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Arc;
@@ -54,6 +53,7 @@ use types::*;
 /// # Safety
 /// `client_ptr` must be a valid non-null pointer to a live `he_client_t`.
 unsafe fn sync_conn_info(client_ptr: *mut he_client_t) {
+    // SAFETY: caller guarantees client_ptr is non-null and valid.
     let client = unsafe { &mut *client_ptr };
     let Some(ref mut connection) = client.connection else {
         return;
@@ -190,6 +190,7 @@ pub unsafe extern "C" fn he_client_get_conn(client: *mut he_client_t) -> *mut he
     if client.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: null check above; client is valid and conn is its first field.
     unsafe { &mut (*client).conn as *mut he_conn_t }
 }
 
@@ -204,6 +205,7 @@ pub unsafe extern "C" fn he_client_get_ssl_ctx(
     if client.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: null check above; client is valid for this call.
     unsafe { &mut (*client).ssl_ctx as *mut conn::he_ssl_ctx_t }
 }
 
@@ -218,6 +220,7 @@ pub unsafe extern "C" fn he_client_is_config_valid(
     if client.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; pointer is valid for the call duration.
     let client = unsafe { &*client };
     // Require at least one auth credential
     let has_user_pass = client.conn.username.is_some() && client.conn.password.is_some();
@@ -246,6 +249,7 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     if client.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; pointer is valid for the call duration.
     let client = unsafe { &mut *client };
     let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -402,6 +406,7 @@ pub unsafe extern "C" fn he_client_disconnect(client: *mut he_client_t) -> he_re
     if client.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; pointer is valid for the call duration.
     let client = unsafe { &mut *client };
     let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -424,7 +429,8 @@ pub unsafe extern "C" fn he_client_disconnect(client: *mut he_client_t) -> he_re
         ] {
             client.conn.state = new_state;
             if let Some(cb) = client.ssl_ctx.state_change_cb {
-                // SAFETY: pointers valid for connection lifetime.
+                // SAFETY: conn_ptr and ctx are valid for the connection lifetime;
+                // new_state is a plain C enum value.
                 unsafe { cb(conn_ptr, new_state, ctx) };
             }
         }
@@ -450,6 +456,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_state_change_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).state_change_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -466,6 +473,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_inside_write_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).inside_write_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -482,6 +490,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_outside_write_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).outside_write_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -498,6 +507,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_network_config_ipv4_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).network_config_ipv4_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -514,6 +524,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_config_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).server_config_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -530,6 +541,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_nudge_time_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).nudge_time_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -546,6 +558,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_event_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).event_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -562,6 +575,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).auth_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -578,6 +592,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_token_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).auth_token_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -594,6 +609,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_buf_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).auth_buf_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -610,6 +626,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_populate_network_config_ipv4_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).populate_network_config_ipv4_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -626,6 +643,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_pmtud_state_change_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).pmtud_state_change_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -642,6 +660,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_pmtud_time_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).pmtud_time_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -662,7 +681,10 @@ pub unsafe extern "C" fn he_ssl_ctx_set_ca(
     if ssl_ctx.is_null() || ca_cert.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null checks above; ca_cert points to `length` readable bytes
+    // as guaranteed by the C API contract.
     let bytes = unsafe { std::slice::from_raw_parts(ca_cert, length) };
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).ca_cert = Some(bytes.to_vec()) };
     he_return_code_t::HE_SUCCESS
 }
@@ -680,9 +702,12 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
     if ssl_ctx.is_null() || server_dn.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; server_dn is a valid NUL-terminated C string
+    // as required by the function's documented contract.
     let s = unsafe { CStr::from_ptr(server_dn) };
     match s.to_str() {
         Ok(s) => {
+            // SAFETY: null check above; ssl_ctx is valid for this call.
             unsafe { (*ssl_ctx).server_dn = Some(CString::new(s).unwrap()) };
             he_return_code_t::HE_SUCCESS
         }
@@ -702,6 +727,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_use_pqc(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).use_pqc = use_pqc };
     he_return_code_t::HE_SUCCESS
 }
@@ -718,6 +744,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_use_chacha20(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).use_chacha20 = use_chacha20 };
     he_return_code_t::HE_SUCCESS
 }
@@ -734,6 +761,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_connection_type(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).connection_type = connection_type };
     he_return_code_t::HE_SUCCESS
 }
@@ -753,6 +781,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_enable_expresslane(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).enable_expresslane = enable };
     he_return_code_t::HE_SUCCESS
 }
@@ -773,6 +802,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).expresslane_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -793,6 +823,7 @@ pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_state_change_cb(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).expresslane_state_change_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
@@ -814,9 +845,11 @@ pub unsafe extern "C" fn he_conn_set_username(
     if conn.is_null() || username.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; username is a valid NUL-terminated C string.
     let s = unsafe { CStr::from_ptr(username) };
     match CString::new(s.to_bytes()) {
         Ok(cs) => {
+            // SAFETY: null check above; conn is valid for this call.
             unsafe { (*conn).username = Some(cs) };
             he_return_code_t::HE_SUCCESS
         }
@@ -837,9 +870,11 @@ pub unsafe extern "C" fn he_conn_set_password(
     if conn.is_null() || password.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; password is a valid NUL-terminated C string.
     let s = unsafe { CStr::from_ptr(password) };
     match CString::new(s.to_bytes()) {
         Ok(cs) => {
+            // SAFETY: null check above; conn is valid for this call.
             unsafe { (*conn).password = Some(cs) };
             he_return_code_t::HE_SUCCESS
         }
@@ -863,7 +898,9 @@ pub unsafe extern "C" fn he_conn_set_auth_token(
     if conn.is_null() || token.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null checks above; token points to `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(token, length) };
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).auth_token = Some(bytes.to_vec()) };
     he_return_code_t::HE_SUCCESS
 }
@@ -881,9 +918,11 @@ pub unsafe extern "C" fn he_conn_set_sni_hostname(
     if conn.is_null() || hostname.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; hostname is a valid NUL-terminated C string.
     let s = unsafe { CStr::from_ptr(hostname) };
     match CString::new(s.to_bytes()) {
         Ok(cs) => {
+            // SAFETY: null check above; conn is valid for this call.
             unsafe { (*conn).sni_hostname = Some(cs) };
             he_return_code_t::HE_SUCCESS
         }
@@ -903,6 +942,7 @@ pub unsafe extern "C" fn he_conn_set_outside_mtu(
     if conn.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).outside_mtu = mtu };
     he_return_code_t::HE_SUCCESS
 }
@@ -920,6 +960,7 @@ pub unsafe extern "C" fn he_conn_set_context(
     if conn.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).context = context };
     he_return_code_t::HE_SUCCESS
 }
@@ -935,6 +976,7 @@ pub unsafe extern "C" fn he_conn_get_nudge_time(conn: *const he_conn_t) -> i32 {
     if conn.is_null() {
         return 0;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).nudge_time_ms }
 }
 
@@ -947,6 +989,7 @@ pub unsafe extern "C" fn he_conn_get_outside_mtu(conn: *const he_conn_t) -> u16 
     if conn.is_null() {
         return 0;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).outside_mtu_negotiated }
 }
 
@@ -961,6 +1004,7 @@ pub unsafe extern "C" fn he_conn_get_effective_pmtu(conn: *const he_conn_t) -> u
     if conn.is_null() {
         return 0;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).effective_pmtu }
 }
 
@@ -975,6 +1019,7 @@ pub unsafe extern "C" fn he_conn_get_current_protocol(
     if conn.is_null() {
         return he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE;
     }
+    // SAFETY: null check above; conn is valid for this call.
     unsafe { (*conn).current_protocol }
 }
 
@@ -989,6 +1034,7 @@ pub unsafe extern "C" fn he_conn_get_cipher_name(conn: *const he_conn_t) -> *con
     if conn.is_null() {
         return std::ptr::null();
     }
+    // SAFETY: null check above; conn is valid for this call.
     match unsafe { &(*conn).cipher_name } {
         Some(cs) => cs.as_ptr(),
         None => std::ptr::null(),
@@ -1006,6 +1052,7 @@ pub unsafe extern "C" fn he_conn_get_curve_name(conn: *const he_conn_t) -> *cons
     if conn.is_null() {
         return std::ptr::null();
     }
+    // SAFETY: null check above; conn is valid for this call.
     match unsafe { &(*conn).curve_name } {
         Some(cs) => cs.as_ptr(),
         None => std::ptr::null(),
@@ -1023,6 +1070,7 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
     if client.is_null() {
         return 0;
     }
+    // SAFETY: null check above; client is valid for this call.
     let client = unsafe { &*client };
     let _guard = client.lock.lock().unwrap();
     match client.connection {
@@ -1030,7 +1078,8 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
             let sid = conn.session_id();
             // SessionId is [u8; 8]; interpret as little-endian u64.
             u64::from_le_bytes(
-                // SAFETY: SessionId is guaranteed to be a [u8; 8] newtype.
+                // SAFETY: SessionId is a [u8; 8] newtype; reading it as [u8; 8]
+            // is always valid and correctly sized.
                 unsafe { std::ptr::read(&sid as *const _ as *const [u8; 8]) }
             )
         }
@@ -1060,10 +1109,11 @@ pub unsafe extern "C" fn he_conn_outside_data_received(
     }
     // Reach up to the owning he_client_t via the conn field being first.
     // SAFETY: he_conn_t is the first field of he_client_t (guaranteed by the
-    // layout in conn.rs), so the pointer arithmetic is valid.
+    // repr(C) layout in conn.rs), so casting conn to he_client_t* is valid.
     let client = unsafe { &mut *(conn as *mut he_client_t) };
     let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
+    // SAFETY: null check above; buffer points to `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(buffer, length) };
     let mut buf = BytesMut::from(bytes);
     let connection_type = match client.ssl_ctx.connection_type {
@@ -1103,9 +1153,11 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
     if conn.is_null() || packet.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: he_conn_t is the first field of he_client_t (repr(C) in conn.rs).
     let client = unsafe { &mut *(conn as *mut he_client_t) };
     let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
+    // SAFETY: null check above; packet points to `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(packet, length) };
     let mut buf = BytesMut::from(bytes);
     let result = {
@@ -1135,6 +1187,7 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
     if conn.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // SAFETY: he_conn_t is the first field of he_client_t (repr(C) in conn.rs).
     let client = unsafe { &mut *(conn as *mut he_client_t) };
     let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1175,6 +1228,8 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
             })
             .unwrap_or(0)
     };
+    // SAFETY: conn is the first field of he_client_t and remains valid
+    // throughout this function under the lock held above.
     unsafe { (*conn).nudge_time_ms = nudge_ms };
 
     he_return_code_t::HE_SUCCESS

@@ -232,6 +232,7 @@ pub struct he_conn_t {
 // SAFETY: `context` is a raw pointer that the C caller guarantees lives long
 // enough.  We only ship it back to C callbacks, never dereference it ourselves.
 unsafe impl Send for he_conn_t {}
+// SAFETY: same as Send — raw pointers are only forwarded to C callbacks.
 unsafe impl Sync for he_conn_t {}
 
 impl Default for he_conn_t {

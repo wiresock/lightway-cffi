@@ -73,6 +73,7 @@ pub struct he_packet_filter_t {
 
 // SAFETY: context is a raw pointer managed entirely by C callers.
 unsafe impl Send for he_packet_filter_t {}
+// SAFETY: same as Send — raw pointer is only forwarded to C callbacks.
 unsafe impl Sync for he_packet_filter_t {}
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -143,6 +144,7 @@ unsafe extern "C" fn domain_filter_handler(
     let df = unsafe { &*(filter as *const he_domain_filter_t) };
 
     // Parse enough of the DNS payload to extract the queried name.
+    // SAFETY: packet points to `length` readable bytes as required by the C API.
     let bytes = unsafe { std::slice::from_raw_parts(packet, length) };
     if let Some(name) = extract_dns_query_name(bytes) {
         // Check allow-list first — allowed domains are never blocked.
@@ -245,6 +247,7 @@ pub(crate) fn load_domains_from_file(path: *const c_char, set: &mut HashSet<Stri
     if path.is_null() {
         return -1;
     }
+    // SAFETY: null check above; path is a valid NUL-terminated C string.
     let c_str = unsafe { CStr::from_ptr(path) };
     let path_str = match c_str.to_str() {
         Ok(s) => s,

@@ -23,6 +23,7 @@ pub(crate) struct CffiExpresslaneCb {
 
 // SAFETY: raw pointers are C-managed and valid for the connection lifetime.
 unsafe impl Send for CffiExpresslaneCb {}
+// SAFETY: same as Send — raw pointers are only forwarded to C callbacks.
 unsafe impl Sync for CffiExpresslaneCb {}
 
 impl CffiExpresslaneCb {

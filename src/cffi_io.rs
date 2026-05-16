@@ -35,6 +35,7 @@ pub(crate) struct CffiOutsideIO {
 // dereference them ourselves — we only pass them back to the C callback, which
 // the C side guarantees are valid for the connection lifetime.
 unsafe impl Send for CffiOutsideIO {}
+// SAFETY: same as Send — raw pointers are only forwarded to C callbacks.
 unsafe impl Sync for CffiOutsideIO {}
 
 impl CffiOutsideIO {
@@ -91,8 +92,9 @@ pub(crate) struct CffiInsideIO {
     ctx: *mut std::ffi::c_void,
 }
 
-// SAFETY: same as CffiOutsideIO.
+// SAFETY: same as CffiOutsideIO — raw pointers are only forwarded to C callbacks.
 unsafe impl Send for CffiInsideIO {}
+// SAFETY: same as Send.
 unsafe impl Sync for CffiInsideIO {}
 
 impl CffiInsideIO {

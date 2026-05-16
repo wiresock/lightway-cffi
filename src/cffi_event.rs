@@ -30,6 +30,7 @@ pub(crate) struct CffiEventCallback {
 
 // SAFETY: all raw pointers are C-managed and valid for the connection lifetime.
 unsafe impl Send for CffiEventCallback {}
+// SAFETY: same as Send — raw pointers are only forwarded to C callbacks.
 unsafe impl Sync for CffiEventCallback {}
 
 impl EventCallback for CffiEventCallback {
