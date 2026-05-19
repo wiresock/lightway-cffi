@@ -335,9 +335,7 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     };
 
     let ctx_builder = if client.ssl_ctx.enable_expresslane {
-        let b = ctx_builder.with_expresslane(std::time::Duration::from_secs(
-            client.ssl_ctx.expresslane_keys_rotation_interval_secs,
-        ));
+        let b = ctx_builder.with_expresslane();
         if let Some(el_cb) = client.ssl_ctx.expresslane_cb {
             b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx))
         } else {

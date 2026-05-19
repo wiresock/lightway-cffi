@@ -164,7 +164,6 @@ pub struct he_ssl_ctx_t {
 
     // Connection-level settings
     pub(crate) enable_expresslane: bool,
-    pub(crate) expresslane_keys_rotation_interval_secs: u64,
     pub(crate) connection_type: he_connection_type_t,
     pub(crate) ca_cert: Option<Vec<u8>>,
     pub(crate) server_dn: Option<CString>,
@@ -191,7 +190,6 @@ impl Default for he_ssl_ctx_t {
             expresslane_cb: None,
             expresslane_state_change_cb: None,
             enable_expresslane: false,
-            expresslane_keys_rotation_interval_secs: 900,
             connection_type: he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM,
             ca_cert: None,
             server_dn: None,
