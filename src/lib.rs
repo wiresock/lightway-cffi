@@ -386,10 +386,12 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     };
 
     // ── 7. connect() → live Connection  ────────────────────────────────────
-    let mut app_state = CffiAppState::default();
-    app_state.nudge_time_cb = client.ssl_ctx.nudge_time_cb;
-    app_state.conn_ptr = conn_ptr;
-    app_state.ctx = ctx;
+    let app_state = CffiAppState {
+        nudge_time_cb: client.ssl_ctx.nudge_time_cb,
+        conn_ptr,
+        ctx,
+        ..CffiAppState::default()
+    };
     let connection = match conn_builder.connect(app_state) {
         Ok(c) => c,
         Err(_) => return he_return_code_t::HE_ERR_SSL_ERROR,

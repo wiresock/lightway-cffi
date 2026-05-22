@@ -51,6 +51,8 @@ impl Default for CffiAppState {
 // SAFETY: raw pointers are only forwarded to C callbacks whose lifetimes
 // the C caller guarantees exceed the connection lifetime.
 unsafe impl Send for CffiAppState {}
+// SAFETY: raw pointers are only forwarded to C callbacks whose lifetimes
+// the C caller guarantees exceed the connection lifetime.
 unsafe impl Sync for CffiAppState {}
 
 // ──────────────────────────────────────────────────────────────────────────────
