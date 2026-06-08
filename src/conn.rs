@@ -5,12 +5,12 @@
 //! all per-connection state: the Rust `Connection` (or its builder), the
 //! configured callbacks, credential strings, and SSL-context settings.
 //!
-//! `he_conn_t` and `he_ssl_ctx_t` in the OSS C library are separate structs
-//! that live **inside** `he_client_t`; we mirror that layout so that C code
-//! can write `client->conn` and `client->ssl_ctx` and get valid pointers.
+//! `he_conn_t` and `he_ssl_ctx_t` are embedded inside `he_client_t` to match
+//! the memory layout expected by the C API; callers access them exclusively
+//! through the exported FFI accessor functions.
 
 use std::ffi::{CString, c_char, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lightway_core::Connection;
 
@@ -203,10 +203,23 @@ impl Default for he_ssl_ctx_t {
 // Connection object
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Per-connection state.  Accessed via `client->conn` from C.
+/// Per-connection state embedded inside `he_client_t`.
 ///
-/// Holds credentials and runtime state for a single tunnel connection.
+/// Exposed to C via `he_client_get_conn()`; holds credentials and runtime
+/// state for a single tunnel connection.
 pub struct he_conn_t {
+    /// Back-pointer to the owning `he_client_t`.  Set by `he_client_t::new()`
+    /// so that functions receiving only a `*mut he_conn_t` can recover the
+    /// parent without relying on a specific field offset.
+    pub(crate) client_ptr: *mut he_client_t,
+
+    /// Serialises concurrent calls into the owning `he_client_t`.
+    /// Lives here so that `with_client` can clone and lock it from
+    /// `*mut he_conn_t` before creating `&mut he_client_t`, avoiding any
+    /// aliasing between the `MutexGuard` borrow and the mutable reference
+    /// handed to the closure.
+    pub(crate) arc_lock: Arc<Mutex<()>>,
+
     // Auth credentials — only one of (username+password) or auth_token is set
     pub(crate) username: Option<CString>,
     pub(crate) password: Option<CString>,
@@ -229,15 +242,25 @@ pub struct he_conn_t {
     pub(crate) cipher_name: Option<CString>,
 }
 
-// SAFETY: `context` is a raw pointer that the C caller guarantees lives long
-// enough.  We only ship it back to C callbacks, never dereference it ourselves.
+// SAFETY: Both raw pointer fields in he_conn_t are safe to send across threads:
+// - `context` is an opaque C pointer forwarded only to C callbacks; it is
+//   never dereferenced by Rust code.
+// - `client_ptr` points to the owning `he_client_t` allocation; it is written
+//   once in `he_client_t::new()` and only dereferenced in this crate after
+//   acquiring `arc_lock` (see `with_client`).
+// - `arc_lock` is an `Arc<Mutex<()>>` which is itself `Send + Sync`.
+// Note: other `he_conn_t` fields (credentials, runtime state) may be read or
+// written by FFI setters/getters without holding the lock; thread-safety for
+// those accesses is a caller responsibility.
 unsafe impl Send for he_conn_t {}
-// SAFETY: same as Send — raw pointers are only forwarded to C callbacks.
+// SAFETY: Same reasoning as Send.
 unsafe impl Sync for he_conn_t {}
 
 impl Default for he_conn_t {
     fn default() -> Self {
         Self {
+            client_ptr: std::ptr::null_mut(),
+            arc_lock: Arc::new(Mutex::new(())),
             username: None,
             password: None,
             auth_token: None,
@@ -261,40 +284,33 @@ impl Default for he_conn_t {
 
 /// Top-level handle allocated by `he_client_create()`.
 ///
-/// C code holds a `he_client_t*` and accesses `client->conn` and
-/// `client->ssl_ctx`.  The `Mutex` on the inner state serialises concurrent
-/// `he_conn_outside_data_received` / `he_conn_inside_packet_received` calls
-/// (matching the `std::mutex` in `helium_wrapper`).
+/// C callers treat this struct as opaque and interact with it via the accessor
+/// functions declared in `lightway_cffi.h` (e.g. `he_client_get_conn`,
+/// `he_client_get_ssl_ctx`).  Concurrent data-path calls (e.g.
+/// `he_conn_outside_data_received`, `he_conn_inside_packet_received`,
+/// `he_conn_nudge`) are serialised internally by the library before any
+/// mutable access to the underlying client state.
 ///
 pub struct he_client_t {
-    /// Inlined connection object — accessed as `client->conn`.
+    /// Embedded connection object; exposed to C via accessor functions.
     pub conn: he_conn_t,
-    /// Inlined SSL-context object — accessed as `client->ssl_ctx`.
+    /// Embedded SSL-context object; exposed to C via accessor functions.
     pub ssl_ctx: he_ssl_ctx_t,
     /// Live Rust Connection, present after `he_client_connect()` succeeds.
     pub(crate) connection: Option<Connection<CffiAppState>>,
-    /// Serialises concurrent calls into the connection.
-    pub(crate) lock: Mutex<()>,
 }
 
-/// Compile-time proof that `conn` is at offset 0 inside `he_client_t`.
-///
-/// Functions like `he_conn_outside_data_received` and `he_conn_nudge` receive
-/// a `*mut he_conn_t` from C and cast it to `*mut he_client_t`, relying on
-/// `conn` being the first field with no leading padding.  This assertion
-/// catches any future reordering by the compiler.
-const _: () = assert!(
-    std::mem::offset_of!(he_client_t, conn) == 0,
-    "he_client_t::conn must be at offset 0 for the conn→client pointer cast to be valid",
-);
 
 impl he_client_t {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> Box<Self> {
+        let mut client = Box::new(Self {
             conn: he_conn_t::default(),
             ssl_ctx: he_ssl_ctx_t::default(),
             connection: None,
-            lock: Mutex::new(()),
-        }
+        });
+        // Store the back-pointer so he_conn_t can recover its parent.
+        // SAFETY: the Box address is stable for the lifetime of the allocation.
+        client.conn.client_ptr = &raw mut *client;
+        client
     }
 }

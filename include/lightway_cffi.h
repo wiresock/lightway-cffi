@@ -278,18 +278,21 @@ typedef enum {
 /*
  Top-level handle allocated by `he_client_create()`.
 
- C code holds a `he_client_t*` and accesses `client->conn` and
- `client->ssl_ctx`.  The `Mutex` on the inner state serialises concurrent
- `he_conn_outside_data_received` / `he_conn_inside_packet_received` calls
- (matching the `std::mutex` in `helium_wrapper`).
+ C callers treat this struct as opaque and interact with it via the accessor
+ functions declared in `lightway_cffi.h` (e.g. `he_client_get_conn`,
+ `he_client_get_ssl_ctx`).  Concurrent data-path calls (e.g.
+ `he_conn_outside_data_received`, `he_conn_inside_packet_received`,
+ `he_conn_nudge`) are serialised internally by the library before any
+ mutable access to the underlying client state.
 
  */
 typedef struct he_client_t he_client_t;
 
 /*
- Per-connection state.  Accessed via `client->conn` from C.
+ Per-connection state embedded inside `he_client_t`.
 
- Holds credentials and runtime state for a single tunnel connection.
+ Exposed to C via `he_client_get_conn()`; holds credentials and runtime
+ state for a single tunnel connection.
  */
 typedef struct he_conn_t he_conn_t;
 
@@ -513,7 +516,7 @@ void he_cleanup(void);
 /*
  Allocate a new `he_client_t`.
 
- Returns a heap-allocated pointer on success, or null on allocation failure.
+ Returns a heap-allocated pointer. Aborts on allocation failure.
  The caller must free it with `he_client_destroy`.
 
  # Safety
@@ -526,7 +529,12 @@ he_client_t *he_client_create(void);
 
  # Safety
  `client` must be a valid pointer obtained from `he_client_create` and must
- not be used after this call.
+ not be used after this call.  The caller is responsible for ensuring that
+ no other thread is concurrently calling any `he_*` function on the same
+ client; destruction is not internally serialised.  In particular,
+ `he_client_destroy` must not be called from within any callback that is
+ invoked while the per-client mutex is held (e.g. from a state-change
+ callback triggered by `he_client_disconnect`).
  */
 void he_client_destroy(he_client_t *client);
 
