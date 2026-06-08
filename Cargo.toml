@@ -19,7 +19,7 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 bytes = "1.6.0"
-lightway-core = { git = "https://github.com/expressvpn/lightway", rev = "2344967fe1b08e335e8abe076beb42545d4eae74" }
+lightway-core = { git = "https://github.com/expressvpn/lightway" }
 tracing = "0.1.40"
 
 [build-dependencies]

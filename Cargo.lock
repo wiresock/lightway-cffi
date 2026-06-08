@@ -498,7 +498,7 @@ dependencies = [
 [[package]]
 name = "lightway-core"
 version = "0.1.0"
-source = "git+https://github.com/expressvpn/lightway?rev=2344967fe1b08e335e8abe076beb42545d4eae74#2344967fe1b08e335e8abe076beb42545d4eae74"
+source = "git+https://github.com/expressvpn/lightway#d857eaedc5c9d4214c0d1d7c45783b5922135754"
 dependencies = [
  "anyhow",
  "bitfield-struct",
