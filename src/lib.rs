@@ -399,6 +399,22 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
 
     client.connection = Some(connection);
 
+    // `Connection::new()` initialises `state` to `State::Connecting` directly
+    // (not via `set_state()`), so the EventCallback is never invoked for the
+    // initial Connecting transition.  Synthesise it here so the C-side state
+    // field and state-change callback stay consistent with the Rust state.
+    //
+    // Guard on an actual state change so the callback is not fired spuriously
+    // if `he_client_connect()` is called again without a full teardown.
+    if client.conn.state != he_conn_state_t::HE_STATE_CONNECTING {
+        client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
+        if let Some(cb) = client.ssl_ctx.state_change_cb {
+            // SAFETY: conn_ptr and ctx are valid C pointers for the connection
+            // lifetime; no Rust data is dereferenced through them by the callback.
+            unsafe { cb(conn_ptr, he_conn_state_t::HE_STATE_CONNECTING, ctx) };
+        }
+    }
+
     he_return_code_t::HE_SUCCESS
 }
 

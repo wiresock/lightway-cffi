@@ -265,6 +265,7 @@ impl Default for he_conn_t {
 /// `client->ssl_ctx`.  The `Mutex` on the inner state serialises concurrent
 /// `he_conn_outside_data_received` / `he_conn_inside_packet_received` calls
 /// (matching the `std::mutex` in `helium_wrapper`).
+///
 pub struct he_client_t {
     /// Inlined connection object — accessed as `client->conn`.
     pub conn: he_conn_t,
@@ -275,6 +276,17 @@ pub struct he_client_t {
     /// Serialises concurrent calls into the connection.
     pub(crate) lock: Mutex<()>,
 }
+
+/// Compile-time proof that `conn` is at offset 0 inside `he_client_t`.
+///
+/// Functions like `he_conn_outside_data_received` and `he_conn_nudge` receive
+/// a `*mut he_conn_t` from C and cast it to `*mut he_client_t`, relying on
+/// `conn` being the first field with no leading padding.  This assertion
+/// catches any future reordering by the compiler.
+const _: () = assert!(
+    std::mem::offset_of!(he_client_t, conn) == 0,
+    "he_client_t::conn must be at offset 0 for the conn→client pointer cast to be valid",
+);
 
 impl he_client_t {
     pub(crate) fn new() -> Self {
