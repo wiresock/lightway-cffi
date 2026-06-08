@@ -282,6 +282,7 @@ typedef enum {
  `client->ssl_ctx`.  The `Mutex` on the inner state serialises concurrent
  `he_conn_outside_data_received` / `he_conn_inside_packet_received` calls
  (matching the `std::mutex` in `helium_wrapper`).
+
  */
 typedef struct he_client_t he_client_t;
 
