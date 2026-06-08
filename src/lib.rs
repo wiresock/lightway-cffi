@@ -25,8 +25,8 @@ mod version;
 
 use bytes::BytesMut;
 use lightway_core::{
-    AuthMethod, ClientContextBuilder, ConnectionType, OutsideIOSendCallbackArg, OutsidePacket,
-    ProtocolVersion, RootCertificate, TickType,
+    AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
+    OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, TickType,
 };
 
 use cffi_expresslane::CffiExpresslaneCb;
@@ -335,7 +335,7 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     };
 
     let ctx_builder = if client.ssl_ctx.enable_expresslane {
-        let b = ctx_builder.with_expresslane();
+        let b = ctx_builder.with_expresslane(DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL);
         if let Some(el_cb) = client.ssl_ctx.expresslane_cb {
             b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx))
         } else {
