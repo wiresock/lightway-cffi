@@ -47,14 +47,8 @@ use types::*;
 /// `he_conn_t` so that `he_conn_get_current_protocol` / `he_conn_get_curve_name`
 /// return correct values once the connection reaches Online.
 ///
-/// Takes a raw pointer to avoid borrow-checker conflicts with `MutexGuard`
-/// held on `client.lock` in the caller's scope.
-///
-/// # Safety
-/// `client_ptr` must be a valid non-null pointer to a live `he_client_t`.
-unsafe fn sync_conn_info(client_ptr: *mut he_client_t) {
-    // SAFETY: caller guarantees client_ptr is non-null and valid.
-    let client = unsafe { &mut *client_ptr };
+/// Must be called while the caller holds the per-client mutex (`he_conn_t::arc_lock`).
+fn sync_conn_info(client: &mut he_client_t) {
     let Some(ref mut connection) = client.connection else {
         return;
     };
@@ -153,22 +147,26 @@ pub unsafe extern "C" fn he_cleanup() {}
 
 /// Allocate a new `he_client_t`.
 ///
-/// Returns a heap-allocated pointer on success, or null on allocation failure.
+/// Returns a heap-allocated pointer. Aborts on allocation failure.
 /// The caller must free it with `he_client_destroy`.
 ///
 /// # Safety
 /// The returned pointer must be freed with `he_client_destroy`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_client_create() -> *mut he_client_t {
-    let client = Box::new(he_client_t::new());
-    Box::into_raw(client)
+    Box::into_raw(he_client_t::new())
 }
 
 /// Free a `he_client_t` previously allocated by `he_client_create`.
 ///
 /// # Safety
 /// `client` must be a valid pointer obtained from `he_client_create` and must
-/// not be used after this call.
+/// not be used after this call.  The caller is responsible for ensuring that
+/// no other thread is concurrently calling any `he_*` function on the same
+/// client; destruction is not internally serialised.  In particular,
+/// `he_client_destroy` must not be called from within any callback that is
+/// invoked while the per-client mutex is held (e.g. from a state-change
+/// callback triggered by `he_client_disconnect`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_client_destroy(client: *mut he_client_t) {
     if !client.is_null() {
@@ -250,8 +248,13 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
     // SAFETY: null check above; pointer is valid for the call duration.
+    // Clone arc_lock via raw pointer before creating &mut he_client_t so that
+    // the MutexGuard's internal borrow (into the Arc allocation) and the
+    // &mut he_client_t reference do not overlap.
+    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
+    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: null check above; lock is held; pointer is valid for this call.
     let client = unsafe { &mut *client };
-    let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // ── 1. Validate ────────────────────────────────────────────────────────
     let Some(outside_write_cb) = client.ssl_ctx.outside_write_cb else {
@@ -394,7 +397,9 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     };
     let connection = match conn_builder.connect(app_state) {
         Ok(c) => c,
-        Err(_) => return he_return_code_t::HE_ERR_SSL_ERROR,
+        Err(_) => {
+            return he_return_code_t::HE_ERR_SSL_ERROR;
+        }
     };
 
     client.connection = Some(connection);
@@ -428,8 +433,12 @@ pub unsafe extern "C" fn he_client_disconnect(client: *mut he_client_t) -> he_re
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
     // SAFETY: null check above; pointer is valid for the call duration.
+    // Clone arc_lock via raw pointer before creating &mut he_client_t so that
+    // the MutexGuard's internal borrow and the &mut he_client_t do not overlap.
+    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
+    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: null check above; lock is held; pointer is valid for this call.
     let client = unsafe { &mut *client };
-    let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Drive a graceful TLS goodbye if the Connection is live.
     if let Some(ref mut connection) = client.connection {
@@ -1092,8 +1101,12 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
         return 0;
     }
     // SAFETY: null check above; client is valid for this call.
+    // Clone arc_lock via raw pointer before creating &he_client_t to avoid
+    // the guard's borrow overlapping the struct reference.
+    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
+    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: null check above; lock is held; pointer is valid for this call.
     let client = unsafe { &*client };
-    let _guard = client.lock.lock().unwrap();
     match client.connection {
         Some(ref conn) => {
             let sid = conn.session_id();
@@ -1112,6 +1125,44 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
 // Data path
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Recover the owning [`he_client_t`] from a `*mut he_conn_t`, acquire its
+/// lock, and invoke `f` with a mutable reference to the client.
+///
+/// Returns `Err(HE_ERR_FAILED)` if `conn` is null or the back-pointer has not
+/// been initialised (i.e. `client_ptr` is null).
+///
+/// # Safety
+/// `conn` must be a valid, non-null pointer to a `he_conn_t` whose
+/// `client_ptr` field was set by `he_client_t::new()` and has not been freed.
+/// `f` must not let any reference derived from `&mut he_client_t` escape the
+/// closure (e.g. by returning or storing it), because the mutex guard is
+/// released when this function returns and any escaped reference would then
+/// alias unprotected data.
+#[inline]
+unsafe fn with_client<F, R>(conn: *mut he_conn_t, f: F) -> Result<R, he_return_code_t>
+where
+    F: FnOnce(&mut he_client_t) -> R,
+{
+    if conn.is_null() {
+        return Err(he_return_code_t::HE_ERR_FAILED);
+    }
+    // SAFETY: conn is non-null (checked above) and valid per caller contract.
+    let client_ptr = unsafe { (*conn).client_ptr };
+    if client_ptr.is_null() {
+        return Err(he_return_code_t::HE_ERR_FAILED);
+    }
+    // SAFETY: conn is non-null (checked above). We clone arc_lock before creating
+    // &mut he_client_t so that no shared reference into the he_client_t allocation
+    // overlaps the mutable reference created below. We then lock via the clone to
+    // serialise access to the client state.
+    let arc_lock = unsafe { (*conn).arc_lock.clone() };
+    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: lock is held; no other &mut to this allocation can exist.
+    let client = unsafe { &mut *client_ptr };
+    Ok(f(client))
+}
+
+
 /// Feed an encrypted packet received from the wire into the connection.
 ///
 /// The decrypted inner payload will be returned via `inside_write_cb`.
@@ -1128,33 +1179,34 @@ pub unsafe extern "C" fn he_conn_outside_data_received(
     if conn.is_null() || buffer.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
-    // Reach up to the owning he_client_t via the conn field being first.
-    // SAFETY: he_conn_t is the first field of he_client_t (guaranteed by the
-    // repr(C) layout in conn.rs), so casting conn to he_client_t* is valid.
-    let client = unsafe { &mut *(conn as *mut he_client_t) };
-    let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
-
     // SAFETY: null check above; buffer points to `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(buffer, length) };
     let mut buf = BytesMut::from(bytes);
-    let connection_type = match client.ssl_ctx.connection_type {
-        he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM => ConnectionType::Datagram,
-        he_connection_type_t::HE_CONNECTION_TYPE_STREAM => ConnectionType::Stream,
-    };
-    let result = {
-        let Some(ref mut connection) = client.connection else {
-            return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-        };
-        let pkt = OutsidePacket::Wire(&mut buf, connection_type);
-        match connection.outside_data_received(pkt) {
-            Ok(_) => he_return_code_t::HE_SUCCESS,
-            Err(e) if e.is_fatal(connection_type) => he_return_code_t::HE_ERR_FAILED,
-            Err(_) => he_return_code_t::HE_SUCCESS,
-        }
-    };
-    // SAFETY: conn == &client.conn == base of he_client_t; valid for our scope.
-    unsafe { sync_conn_info(conn as *mut he_client_t) };
-    result
+    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
+    // client_ptr back-pointer was initialised by he_client_t::new().
+    // sync_conn_info runs inside the closure, under the lock.
+    match unsafe {
+        with_client(conn, |client| {
+            let connection_type = match client.ssl_ctx.connection_type {
+                he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM => ConnectionType::Datagram,
+                he_connection_type_t::HE_CONNECTION_TYPE_STREAM => ConnectionType::Stream,
+            };
+            let Some(ref mut connection) = client.connection else {
+                return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
+            };
+            let pkt = OutsidePacket::Wire(&mut buf, connection_type);
+            let rc = match connection.outside_data_received(pkt) {
+                Ok(_) => he_return_code_t::HE_SUCCESS,
+                Err(e) if e.is_fatal(connection_type) => he_return_code_t::HE_ERR_FAILED,
+                Err(_) => he_return_code_t::HE_SUCCESS,
+            };
+            sync_conn_info(client);
+            rc
+        })
+    } {
+        Ok(r) => r,
+        Err(e) => e,
+    }
 }
 
 /// Feed a plaintext inner packet into the connection for encryption and
@@ -1174,28 +1226,31 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
     if conn.is_null() || packet.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
-    // SAFETY: he_conn_t is the first field of he_client_t (repr(C) in conn.rs).
-    let client = unsafe { &mut *(conn as *mut he_client_t) };
-    let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
-
     // SAFETY: null check above; packet points to `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(packet, length) };
     let mut buf = BytesMut::from(bytes);
-    let result = {
-        let Some(ref mut connection) = client.connection else {
-            return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-        };
-        match connection.inside_data_received(&mut buf) {
-            Ok(()) => he_return_code_t::HE_SUCCESS,
-            Err(lightway_core::ConnectionError::InvalidState) => {
-                he_return_code_t::HE_ERR_INVALID_CONN_STATE
-            }
-            Err(_) => he_return_code_t::HE_ERR_FAILED,
-        }
-    };
-    // SAFETY: conn == &client.conn == base of he_client_t; valid for our scope.
-    unsafe { sync_conn_info(conn as *mut he_client_t) };
-    result
+    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
+    // client_ptr back-pointer was initialised by he_client_t::new().
+    // sync_conn_info runs inside the closure, under the lock.
+    match unsafe {
+        with_client(conn, |client| {
+            let Some(ref mut connection) = client.connection else {
+                return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
+            };
+            let rc = match connection.inside_data_received(&mut buf) {
+                Ok(()) => he_return_code_t::HE_SUCCESS,
+                Err(lightway_core::ConnectionError::InvalidState) => {
+                    he_return_code_t::HE_ERR_INVALID_CONN_STATE
+                }
+                Err(_) => he_return_code_t::HE_ERR_FAILED,
+            };
+            sync_conn_info(client);
+            rc
+        })
+    } {
+        Ok(r) => r,
+        Err(e) => e,
+    }
 }
 
 /// Nudge the connection — retransmit handshake messages if the keepalive
@@ -1208,50 +1263,54 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
     if conn.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
-    // SAFETY: he_conn_t is the first field of he_client_t (repr(C) in conn.rs).
-    let client = unsafe { &mut *(conn as *mut he_client_t) };
-    let _guard = client.lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Fire a D/TLS retransmit tick if the deadline has passed.
-    let now = std::time::Instant::now();
-
-    let ticked = {
-        let Some(ref mut connection) = client.connection else {
-            return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-        };
-        let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
-        if should_tick {
-            connection.app_state_mut().next_tick = None;
-            match connection.tick(TickType::ConnectionTick) {
-                Ok(()) => {}
-                Err(_) => return he_return_code_t::HE_ERR_FAILED,
+    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
+    // client_ptr back-pointer was initialised by he_client_t::new().
+    // All reads/writes to client state (including conn.nudge_time_ms) happen
+    // inside the closure, under the per-client mutex (he_conn_t::arc_lock).
+    match unsafe {
+        with_client(conn, |client| {
+            // Capture now after acquiring the lock so tick decisions and
+            // nudge_ms computations reflect a consistent, current instant.
+            let now = std::time::Instant::now();
+            let Some(ref mut connection) = client.connection else {
+                return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+            };
+            let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
+            if should_tick {
+                connection.app_state_mut().next_tick = None;
+                match connection.tick(TickType::ConnectionTick) {
+                    Ok(()) => {}
+                    Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
+                }
+                sync_conn_info(client);
+                // Compute nudge_ms using the pre-captured `now` for consistency.
+                let nudge_ms = client
+                    .connection
+                    .as_ref()
+                    .and_then(|c| c.app_state().next_tick)
+                    .map(|t| {
+                        let remaining = t.saturating_duration_since(now);
+                        remaining.as_millis().min(i32::MAX as u128) as i32
+                    })
+                    .unwrap_or(0);
+                client.conn.nudge_time_ms = nudge_ms;
+            } else {
+                let nudge_ms = connection
+                    .app_state()
+                    .next_tick
+                    .map(|t| {
+                        let remaining = t.saturating_duration_since(now);
+                        remaining.as_millis().min(i32::MAX as u128) as i32
+                    })
+                    .unwrap_or(0);
+                client.conn.nudge_time_ms = nudge_ms;
             }
-        }
-        should_tick
-    };
-
-    if ticked {
-        // SAFETY: conn == &client.conn == base of he_client_t; valid for our scope.
-        unsafe { sync_conn_info(conn as *mut he_client_t) };
+            Ok(())
+        })
+    } {
+        Ok(Ok(())) => he_return_code_t::HE_SUCCESS,
+        Ok(Err(e)) => e,
+        Err(e) => e,
     }
-
-    // Expose the next nudge deadline as milliseconds for the C caller.
-    let nudge_ms = {
-        let Some(ref connection) = client.connection else {
-            return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-        };
-        connection
-            .app_state()
-            .next_tick
-            .map(|t| {
-                let remaining = t.saturating_duration_since(now);
-                remaining.as_millis().min(i32::MAX as u128) as i32
-            })
-            .unwrap_or(0)
-    };
-    // SAFETY: conn is the first field of he_client_t and remains valid
-    // throughout this function under the lock held above.
-    unsafe { (*conn).nudge_time_ms = nudge_ms };
-
-    he_return_code_t::HE_SUCCESS
 }
