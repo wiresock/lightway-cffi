@@ -298,10 +298,12 @@ impl Drop for he_conn_t {
             scrub_bytes(token);
         }
         if let Some(pw) = self.password.take() {
-            scrub_bytes(&mut pw.into_bytes());
+            let mut pw_bytes = pw.into_bytes();
+            scrub_bytes(&mut pw_bytes);
         }
         if let Some(user) = self.username.take() {
-            scrub_bytes(&mut user.into_bytes());
+            let mut user_bytes = user.into_bytes();
+            scrub_bytes(&mut user_bytes);
         }
     }
 }

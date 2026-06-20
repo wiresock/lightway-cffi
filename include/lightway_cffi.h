@@ -262,6 +262,20 @@ typedef enum {
 } he_padding_type_t;
 
 /*
+ Transport type for a Lightway connection.
+ */
+typedef enum {
+    /*
+     UDP / DTLS transport.
+     */
+    HE_CONNECTION_TYPE_DATAGRAM = 0,
+    /*
+     TCP / TLS transport.
+     */
+    HE_CONNECTION_TYPE_STREAM = 1,
+} he_connection_type_t;
+
+/*
  Top-level handle allocated by `he_client_create()`.
 
  C callers treat this struct as opaque and interact with it via the accessor

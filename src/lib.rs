@@ -889,15 +889,16 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
     // SAFETY: null check above; server_dn is a valid NUL-terminated C string
     // as required by the function's documented contract.
     let s = unsafe { CStr::from_ptr(server_dn) };
-    // Validate UTF-8 (the DN is later passed to lightway-core as &str), then
-    // re-wrap.  Handle both error paths instead of panicking via unwrap().
-    match s.to_str().ok().and_then(|s| CString::new(s).ok()) {
-        Some(cs) => {
+    // The DN is later handed to lightway-core as &str, so validate UTF-8 here.
+    // `s` is already a CStr (NUL-terminated, no interior NUL), so clone it with
+    // to_owned() rather than re-scanning and reallocating via CString::new.
+    match s.to_str() {
+        Ok(_) => {
             // SAFETY: null check above; ssl_ctx is valid for this call.
-            unsafe { (*ssl_ctx).server_dn = Some(cs) };
+            unsafe { (*ssl_ctx).server_dn = Some(s.to_owned()) };
             he_return_code_t::HE_SUCCESS
         }
-        None => he_return_code_t::HE_ERR_BAD_PARAM,
+        Err(_) => he_return_code_t::HE_ERR_BAD_PARAM,
     }
 }
 
