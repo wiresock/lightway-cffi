@@ -167,18 +167,25 @@ fn sync_conn_info(client: &mut he_client_t) {
 ///
 /// Must be called while the per-client lock is held.
 fn fatal_disconnect(client: &mut he_client_t) {
-    client.connection = None;
+    // Already torn down (e.g. lightway-core already signalled Disconnected):
+    // just make sure the live Connection is dropped.
     if client.conn.state == he_conn_state_t::HE_STATE_DISCONNECTED {
+        client.connection = None;
         return;
     }
     client.conn.state = he_conn_state_t::HE_STATE_DISCONNECTED;
     let conn_ptr: *mut he_conn_t = &mut client.conn;
     let ctx = client.conn.context;
     if let Some(cb) = client.ssl_ctx.state_change_cb {
-        // SAFETY: conn_ptr and ctx are valid for the connection lifetime;
-        // the state value is a plain C enum.
+        // SAFETY: conn_ptr points into the he_client_t allocation (stable for
+        // the client's lifetime) and ctx is caller-managed; both stay valid
+        // independent of the live Connection. The state value is a plain C enum.
         unsafe { cb(conn_ptr, he_conn_state_t::HE_STATE_DISCONNECTED, ctx) };
     }
+    // Drop the live Connection only *after* the callback, matching the ordering
+    // in client_disconnect_locked so the connection stays queryable during the
+    // transition.
+    client.connection = None;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1732,12 +1739,12 @@ mod tests {
     fn ffi_guard_contains_panic() {
         // A panic inside the guarded body must be converted to the default
         // return value, never unwound across the (simulated) FFI boundary.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the backtrace
+        // The default panic hook prints one line for the deliberate panic
+        // below; that is expected. We avoid mutating the global hook because it
+        // would race other tests running in parallel.
         let r = ffi_guard(he_return_code_t::HE_ERR_FAILED, || -> he_return_code_t {
-            panic!("boom")
+            panic!("ffi_guard test panic (expected)")
         });
-        std::panic::set_hook(prev);
         assert_eq!(r, he_return_code_t::HE_ERR_FAILED);
     }
 
