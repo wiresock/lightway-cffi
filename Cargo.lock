@@ -492,13 +492,12 @@ dependencies = [
  "bytes",
  "cbindgen",
  "lightway-core",
- "tracing",
 ]
 
 [[package]]
 name = "lightway-core"
 version = "0.1.0"
-source = "git+https://github.com/expressvpn/lightway#d857eaedc5c9d4214c0d1d7c45783b5922135754"
+source = "git+https://github.com/expressvpn/lightway?rev=d857eaedc5c9d4214c0d1d7c45783b5922135754#d857eaedc5c9d4214c0d1d7c45783b5922135754"
 dependencies = [
  "anyhow",
  "bitfield-struct",

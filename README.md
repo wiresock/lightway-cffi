@@ -12,10 +12,26 @@ changes to their existing `lightway_tunnel.h` call sites.
 
 - Full Lightway client connection lifecycle (`he_client_create`, `he_client_connect`, …)
 - ExpressLane fast-path support — key-material callback and state-change callback
-- Path MTU Discovery (PMTUD) callbacks
-- DNS domain filter / threat-manager (`he_domain_filter_t`, `he_packet_filter_t`)
-- ChaCha20 and post-quantum cryptography flags
-- Thread-safe: concurrent `he_conn_outside_data_received` / `he_conn_inside_packet_received` calls are serialised internally
+- ChaCha20 cipher selection
+- Thread-safe: concurrent `he_conn_outside_data_received` / `he_conn_inside_packet_received` /
+  `he_conn_nudge` calls are serialised internally. Re-entrant calls into a locking API from
+  within a C callback are rejected with `HE_ERR_INVALID_CONN_STATE` rather than dead-locking.
+- Panics from `lightway-core` / wolfSSL or from C callbacks are contained at the FFI boundary
+  (returned as `HE_ERR_FAILED`) instead of aborting the process.
+
+## Limitations
+
+- **Post-quantum crypto:** the pinned `lightway-core` `ClientContextBuilder` exposes no
+  client-side key-share/group API, so `he_ssl_ctx_set_use_pqc(ctx, true)` returns
+  `HE_ERR_BAD_PARAM` rather than silently connecting without PQC. Passing `false` succeeds.
+- **PMTUD:** Path MTU Discovery is not driven by this shim. The PMTUD callback setters and
+  `he_conn_get_effective_pmtu` are retained for ABI compatibility but the callbacks never fire
+  and the effective PMTU is always reported as `0`.
+- **Threat-manager / packet filter:** `he_packet_filter_t` / `he_domain_filter_t` are provided by
+  the C consumer (`common/threat-manager/packet_filter.h`), not by this crate.
+- **Server-role callbacks** (`he_ssl_ctx_set_auth_cb`, `…_auth_token_cb`, `…_auth_buf_cb`,
+  `…_populate_network_config_ipv4_cb`) are accepted for source compatibility but unused by this
+  client-only shim.
 
 ## Building
 

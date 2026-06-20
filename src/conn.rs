@@ -10,6 +10,7 @@
 //! through the exported FFI accessor functions.
 
 use std::ffi::{CString, c_char, c_void};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use lightway_core::Connection;
@@ -220,6 +221,15 @@ pub struct he_conn_t {
     /// handed to the closure.
     pub(crate) arc_lock: Arc<Mutex<()>>,
 
+    /// Token of the thread currently holding `arc_lock` (0 when unlocked).
+    /// Used to detect re-entrant calls from within a C callback (which runs
+    /// while the lock is held): re-acquiring `arc_lock` on the same thread
+    /// would dead-lock the non-reentrant mutex *and* alias the outstanding
+    /// `&mut he_client_t`, so such calls are rejected instead.  Lives next to
+    /// `arc_lock` so it can be cloned from a `*mut he_conn_t` before any
+    /// `&mut he_client_t` is created.
+    pub(crate) lock_owner: Arc<AtomicU64>,
+
     // Auth credentials — only one of (username+password) or auth_token is set
     pub(crate) username: Option<CString>,
     pub(crate) password: Option<CString>,
@@ -261,6 +271,7 @@ impl Default for he_conn_t {
         Self {
             client_ptr: std::ptr::null_mut(),
             arc_lock: Arc::new(Mutex::new(())),
+            lock_owner: Arc::new(AtomicU64::new(0)),
             username: None,
             password: None,
             auth_token: None,
@@ -276,6 +287,33 @@ impl Default for he_conn_t {
             cipher_name: None,
         }
     }
+}
+
+impl Drop for he_conn_t {
+    /// Best-effort scrub of secret material so credentials do not linger in
+    /// freed heap memory after the client is destroyed.  `username` is included
+    /// because it is adjacent to the password and equally sensitive in practice.
+    fn drop(&mut self) {
+        if let Some(token) = self.auth_token.as_mut() {
+            scrub_bytes(token);
+        }
+        if let Some(pw) = self.password.take() {
+            scrub_bytes(&mut pw.into_bytes());
+        }
+        if let Some(user) = self.username.take() {
+            scrub_bytes(&mut user.into_bytes());
+        }
+    }
+}
+
+/// Overwrite `buf` with zeros using volatile writes the optimiser may not
+/// elide, then fence to keep the writes ahead of the buffer's deallocation.
+pub(crate) fn scrub_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, writable `u8`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -53,11 +53,14 @@ include = [
     "he_padding_type_t",
 ]
 exclude = [
-    # These types are defined by the C threat-manager library (packet_filter.h).
-    # Exporting the Rust versions would conflict with those definitions.
+    # he_packet_filter_t / he_domain_filter_t and their enums are defined by the
+    # C threat-manager library (packet_filter.h), not by this crate. They are
+    # listed here defensively so that even if such a type is reintroduced on the
+    # Rust side it is never emitted and cannot conflict with the C definitions.
     "he_packet_filter_t",
     "he_domain_filter_t",
     "he_domain_filter_blocking_mode_t",
+    "he_packet_filter_decision_t",
 ]
 
 [export.rename]

@@ -40,7 +40,7 @@ impl ExpresslaneCb<CffiAppState> for CffiExpresslaneCb {
     fn update(&self, session_id: SessionId, data: ExpresslaneCbData, _state: &CffiAppState) {
         let session_id_bytes: [u8; 8] = *session_id.as_bytes();
 
-        let keys = he_expresslane_keys_t {
+        let mut keys = he_expresslane_keys_t {
             session_id: session_id_bytes,
             self_key: data.self_key.0,
             peer_key: data.peer_key.0,
@@ -51,5 +51,11 @@ impl ExpresslaneCb<CffiAppState> for CffiExpresslaneCb {
         unsafe {
             (self.cb)(self.conn_ptr, &keys as *const he_expresslane_keys_t, self.ctx);
         }
+
+        // Scrub our copy of the symmetric key material once the callback (which
+        // installs it into the NDIS driver) has returned, so the keys do not
+        // linger in reused stack memory.
+        crate::conn::scrub_bytes(&mut keys.self_key);
+        crate::conn::scrub_bytes(&mut keys.peer_key);
     }
 }
