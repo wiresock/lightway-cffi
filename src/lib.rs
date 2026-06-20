@@ -1762,4 +1762,41 @@ mod tests {
             he_client_destroy(c);
         }
     }
+
+    #[test]
+    fn fatal_disconnect_fires_disconnected_once_and_clears_connection() {
+        use std::sync::atomic::AtomicU32;
+        static DISCONNECTED_HITS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn count_disconnected(
+            _conn: *mut he_conn_t,
+            new_state: he_conn_state_t,
+            _ctx: *mut c_void,
+        ) -> he_return_code_t {
+            if new_state == he_conn_state_t::HE_STATE_DISCONNECTED {
+                DISCONNECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            he_return_code_t::HE_SUCCESS
+        }
+
+        unsafe {
+            DISCONNECTED_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+            let c = he_client_create();
+            he_ssl_ctx_set_state_change_cb(he_client_get_ssl_ctx(c), count_disconnected);
+
+            // Drive the teardown directly: producing a *real* fatal wire error
+            // needs a live handshake, but this exercises the same state-machine
+            // path (fire DISCONNECTED, set state, drop the live Connection).
+            let client = &mut *c;
+            fatal_disconnect(client);
+            assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_DISCONNECTED);
+            assert!(client.connection.is_none());
+
+            // Idempotent: a second call must not re-fire the transition.
+            fatal_disconnect(client);
+            assert_eq!(DISCONNECTED_HITS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            he_client_destroy(c);
+        }
+    }
 }
