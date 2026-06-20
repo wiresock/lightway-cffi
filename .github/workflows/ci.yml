@@ -16,7 +16,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Pin the Windows image to windows-2022 (Visual Studio 2022). The pinned
+        # wolfssl-sys 4.1.0 build script searches specifically for "MsBuild 2022"
+        # and fails on the windows-latest image, which GitHub redirected to a
+        # Visual Studio 2026 runner on 2026-06-15. Revisit once wolfssl-sys
+        # (pulled transitively via lightway-core) supports newer MSBuild.
+        os: [ubuntu-latest, windows-2022]
 
     steps:
       - uses: actions/checkout@v5
