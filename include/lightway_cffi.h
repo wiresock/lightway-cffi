@@ -537,12 +537,23 @@ he_client_t *he_client_create(void);
 
  # Safety
  `client` must be a valid pointer obtained from `he_client_create` and must
- not be used after this call.  The caller is responsible for ensuring that
- no other thread is concurrently calling any `he_*` function on the same
- client; destruction is not internally serialised.  In particular,
- `he_client_destroy` must not be called from within any callback that is
- invoked while the per-client mutex is held (e.g. from a state-change
- callback triggered by `he_client_disconnect`).
+ not be used after this call.
+
+ Destruction is **not** internally serialised against other calls: the
+ per-client lock cannot protect this because the lock lives *inside* the
+ allocation being freed (and the data path reaches it by dereferencing a
+ `*mut he_conn_t` that points into the same allocation). The caller MUST
+ therefore guarantee that every thread which could call any `he_*` function
+ on this client — in particular the data-path calls
+ `he_conn_outside_data_received`, `he_conn_inside_packet_received` and
+ `he_conn_nudge` — has fully quiesced before calling `he_client_destroy`.
+ Calling a data-path function concurrently with (or after) destruction is a
+ use-after-free. In particular, `he_client_destroy` must not be called from
+ within any callback that runs while the per-client mutex is held (e.g. from
+ a state-change callback triggered by `he_client_disconnect`).
+
+ Enforcing this in-library would require a reference-counted handle (so the
+ allocation outlives in-flight calls); that is a deliberate future change.
  */
 void he_client_destroy(he_client_t *client);
 
@@ -913,7 +924,11 @@ he_connection_protocol_t he_conn_get_current_protocol(const he_conn_t *conn);
 /*
  Get the negotiated cipher suite name, or null if not yet negotiated.
 
- The returned pointer is valid as long as the connection object is alive.
+ The value is captured once when the handshake exposes it and is then stable
+ for the connection's lifetime, so the returned pointer remains valid. This
+ getter takes no lock (and so is safe to call from a callback), but for that
+ reason it should be read after the `HE_STATE_ONLINE` transition, by which
+ point the value is fixed.
 
  # Safety
  `conn` must be a valid non-null pointer or null.
@@ -923,7 +938,8 @@ const char *he_conn_get_cipher_name(const he_conn_t *conn);
 /*
  Get the TLS curve name, or null if not yet negotiated.
 
- The returned pointer is valid as long as the connection object is alive.
+ As with `he_conn_get_cipher_name`, the value is captured once and stable for
+ the connection's lifetime; read it after `HE_STATE_ONLINE`.
 
  # Safety
  `conn` must be a valid non-null pointer or null.

@@ -293,6 +293,12 @@ impl Drop for he_conn_t {
     /// Best-effort scrub of secret material so credentials do not linger in
     /// freed heap memory after the client is destroyed.  `username` is included
     /// because it is adjacent to the password and equally sensitive in practice.
+    ///
+    /// This only scrubs the copies *this crate* owns. Defense-in-depth is
+    /// incomplete: `he_client_connect` clones the password into an owned
+    /// `String` inside lightway-core's `AuthMethod`, and wolfSSL retains key
+    /// material in the live session — neither is scrubbed here, as we do not
+    /// own those buffers.
     fn drop(&mut self) {
         if let Some(token) = self.auth_token.as_mut() {
             scrub_bytes(token);
