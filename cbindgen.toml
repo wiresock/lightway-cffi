@@ -51,13 +51,21 @@ include = [
     # Not referenced in any extern "C" fn signature but needed by consumers
     # (e.g. helium_config_parser.h uses he_padding_type_t in struct fields).
     "he_padding_type_t",
+    # he_ssl_ctx_set_connection_type now takes a raw int (to reject invalid
+    # discriminants), so no function signature references this enum. Force its
+    # emission so the HE_CONNECTION_TYPE_* constants and the trailer alias
+    # `typedef he_connection_type_t he_connection_type;` remain valid.
+    "he_connection_type_t",
 ]
 exclude = [
-    # These types are defined by the C threat-manager library (packet_filter.h).
-    # Exporting the Rust versions would conflict with those definitions.
+    # he_packet_filter_t / he_domain_filter_t and their enums are defined by the
+    # C threat-manager library (packet_filter.h), not by this crate. They are
+    # listed here defensively so that even if such a type is reintroduced on the
+    # Rust side it is never emitted and cannot conflict with the C definitions.
     "he_packet_filter_t",
     "he_domain_filter_t",
     "he_domain_filter_blocking_mode_t",
+    "he_packet_filter_decision_t",
 ]
 
 [export.rename]

@@ -95,32 +95,6 @@ typedef enum {
 } he_return_code_t;
 
 /*
- The negotiated D/TLS protocol version.
- */
-typedef enum {
-    /*
-     Unspecified / not yet negotiated.
-     */
-    HE_CONNECTION_PROTOCOL_NONE = 0,
-    /*
-     DTLS 1.2.
-     */
-    HE_CONNECTION_PROTOCOL_DTLS_1_2 = 1,
-    /*
-     DTLS 1.3.
-     */
-    HE_CONNECTION_PROTOCOL_DTLS_1_3 = 2,
-    /*
-     TLS 1.2.
-     */
-    HE_CONNECTION_PROTOCOL_TLS_1_2 = 3,
-    /*
-     TLS 1.3.
-     */
-    HE_CONNECTION_PROTOCOL_TLS_1_3 = 4,
-} he_connection_protocol_t;
-
-/*
  Lightway connection state, delivered to `he_state_change_cb_t`.
  */
 typedef enum {
@@ -215,20 +189,6 @@ typedef enum {
 } he_pmtud_state_t;
 
 /*
- Transport type for a Lightway connection.
- */
-typedef enum {
-    /*
-     UDP / DTLS transport.
-     */
-    HE_CONNECTION_TYPE_DATAGRAM = 0,
-    /*
-     TCP / TLS transport.
-     */
-    HE_CONNECTION_TYPE_STREAM = 1,
-} he_connection_type_t;
-
-/*
  ExpressLane operational state delivered to `he_expresslane_state_change_cb_t`.
  */
 typedef enum {
@@ -255,6 +215,32 @@ typedef enum {
 } he_expresslane_state_t;
 
 /*
+ The negotiated D/TLS protocol version.
+ */
+typedef enum {
+    /*
+     Unspecified / not yet negotiated.
+     */
+    HE_CONNECTION_PROTOCOL_NONE = 0,
+    /*
+     DTLS 1.2.
+     */
+    HE_CONNECTION_PROTOCOL_DTLS_1_2 = 1,
+    /*
+     DTLS 1.3.
+     */
+    HE_CONNECTION_PROTOCOL_DTLS_1_3 = 2,
+    /*
+     TLS 1.2.
+     */
+    HE_CONNECTION_PROTOCOL_TLS_1_2 = 3,
+    /*
+     TLS 1.3.
+     */
+    HE_CONNECTION_PROTOCOL_TLS_1_3 = 4,
+} he_connection_protocol_t;
+
+/*
  Packet-padding mode.  Mirrors `he_padding_type` from the OSS C library.
  The Rust `lightway-core` does not currently expose padding control via its
  public API; this enum is provided for source-compatibility with consumers
@@ -274,6 +260,20 @@ typedef enum {
      */
     HE_PADDING_450 = 2,
 } he_padding_type_t;
+
+/*
+ Transport type for a Lightway connection.
+ */
+typedef enum {
+    /*
+     UDP / DTLS transport.
+     */
+    HE_CONNECTION_TYPE_DATAGRAM = 0,
+    /*
+     TCP / TLS transport.
+     */
+    HE_CONNECTION_TYPE_STREAM = 1,
+} he_connection_type_t;
 
 /*
  Top-level handle allocated by `he_client_create()`.
@@ -483,18 +483,26 @@ const char *he_wolfssl_version(void);
 /*
  Return a static NUL-terminated name for a return code, suitable for logging.
 
+ Takes the raw integer value (not the `he_return_code_t` enum) so that an
+ out-of-range value from C is reported as `"HE_ERR_UNKNOWN"` rather than
+ being reinterpreted as an invalid enum discriminant (which would be UB).
+
  # Safety
  Always returns a valid, non-null pointer regardless of the value passed.
  */
-const char *he_return_code_name(he_return_code_t code);
+const char *he_return_code_name(int code);
 
 /*
  Return a static NUL-terminated name for a connection protocol.
 
+ Takes the raw integer value (not the `he_connection_protocol_t` enum) so an
+ out-of-range value from C is reported as `"unknown"` rather than triggering
+ UB on an invalid enum discriminant.
+
  # Safety
  Always returns a valid, non-null pointer.
  */
-const char *he_connection_protocol_name(he_connection_protocol_t protocol);
+const char *he_connection_protocol_name(int protocol);
 
 /*
  Initialise the Lightway library.  Must be called once before any other
@@ -623,6 +631,9 @@ he_return_code_t he_ssl_ctx_set_network_config_ipv4_cb(he_ssl_ctx_t *ssl_ctx,
 /*
  Set the server-config callback.
 
+ Accepted for source/ABI compatibility, but this shim does not currently
+ deliver server-config data, so the callback is stored and never invoked.
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
@@ -647,6 +658,9 @@ he_return_code_t he_ssl_ctx_set_event_cb(he_ssl_ctx_t *ssl_ctx, he_event_cb_t cb
 /*
  Set the username/password authentication callback (server role).
 
+ Accepted for source/ABI compatibility with the OSS C library.  This is a
+ client-only shim, so the callback is stored but never invoked.
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
@@ -654,6 +668,9 @@ he_return_code_t he_ssl_ctx_set_auth_cb(he_ssl_ctx_t *ssl_ctx, he_auth_cb_t cb);
 
 /*
  Set the auth-token callback (server role).
+
+ Accepted for source/ABI compatibility with the OSS C library.  This is a
+ client-only shim, so the callback is stored but never invoked.
 
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
@@ -663,6 +680,9 @@ he_return_code_t he_ssl_ctx_set_auth_token_cb(he_ssl_ctx_t *ssl_ctx, he_auth_tok
 /*
  Set the auth-buffer callback (server role).
 
+ Accepted for source/ABI compatibility with the OSS C library.  This is a
+ client-only shim, so the callback is stored but never invoked.
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
@@ -670,6 +690,9 @@ he_return_code_t he_ssl_ctx_set_auth_buf_cb(he_ssl_ctx_t *ssl_ctx, he_auth_buf_c
 
 /*
  Set the populate-network-config callback (server role).
+
+ Accepted for source/ABI compatibility with the OSS C library.  This is a
+ client-only shim, so the callback is stored but never invoked.
 
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
@@ -680,6 +703,10 @@ he_return_code_t he_ssl_ctx_set_populate_network_config_ipv4_cb(he_ssl_ctx_t *ss
 /*
  Set the PMTUD state-change callback.
 
+ NOTE: PMTUD is not currently driven by this shim, so this callback is stored
+ but never invoked.  Accepted for ABI compatibility; see
+ `he_conn_get_effective_pmtu`.
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
@@ -688,6 +715,9 @@ he_return_code_t he_ssl_ctx_set_pmtud_state_change_cb(he_ssl_ctx_t *ssl_ctx,
 
 /*
  Set the PMTUD timer callback.
+
+ NOTE: PMTUD is not currently driven by this shim, so this callback is stored
+ but never invoked.  Accepted for ABI compatibility.
 
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
@@ -717,6 +747,14 @@ he_return_code_t he_ssl_ctx_set_server_dn(he_ssl_ctx_t *ssl_ctx, const char *ser
 /*
  Enable or disable post-quantum cryptography.
 
+ The pinned `lightway-core` `ClientContextBuilder` exposes no API to select
+ the client's TLS key-share groups, so this shim cannot actually enable PQC
+ on a client connection.  Rather than silently accept the request and
+ downgrade security without telling the caller, enabling PQC returns
+ `HE_ERR_BAD_PARAM`; disabling it (the only behaviour we can honour) succeeds.
+ If `lightway-core` later exposes a client PQC/group API, wire it in
+ `client_connect_locked` and relax this check.
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
@@ -733,11 +771,14 @@ he_return_code_t he_ssl_ctx_set_use_chacha20(he_ssl_ctx_t *ssl_ctx, bool use_cha
 /*
  Set the connection transport type (datagram or stream).
 
+ Takes the raw integer value so that an out-of-range value from C is rejected
+ with `HE_ERR_BAD_PARAM` rather than stored as an invalid enum discriminant
+ (which would be UB when later matched on the data path).
+
  # Safety
  `ssl_ctx` must be a valid non-null pointer.
  */
-he_return_code_t he_ssl_ctx_set_connection_type(he_ssl_ctx_t *ssl_ctx,
-                                                he_connection_type_t connection_type);
+he_return_code_t he_ssl_ctx_set_connection_type(he_ssl_ctx_t *ssl_ctx, int connection_type);
 
 /*
  Enable the ExpressLane fast-path data plane for this connection.
@@ -851,10 +892,13 @@ uint16_t he_conn_get_outside_mtu(const he_conn_t *conn);
 /*
  Get the effective path MTU determined by PMTUD.
 
- Returns 0 if PMTUD has not completed.
+ NOTE: this shim does not currently drive Path MTU Discovery (the pinned
+ `lightway-core` requires a PMTUD timer that is not wired here, and exposes no
+ effective-MTU accessor), so this always returns 0.  Retained for ABI
+ compatibility; treat 0 as "PMTUD not available".
 
  # Safety
- `conn` must be a valid non-null pointer.
+ `conn` must be a valid non-null pointer or null.
  */
 uint16_t he_conn_get_effective_pmtu(const he_conn_t *conn);
 
@@ -889,10 +933,11 @@ const char *he_conn_get_curve_name(const he_conn_t *conn);
 /*
  Get the current session ID as a little-endian `uint64_t`.
 
- Returns `0` if no connection is active yet.
+ Returns `0` if no connection is active yet, if `client` is null, or if
+ called re-entrantly from within a callback that already holds the lock.
 
  # Safety
- `client` must be a valid non-null pointer.
+ `client` must be null or a valid pointer from `he_client_create`.
  */
 uint64_t he_conn_get_session_id(const he_client_t *client);
 

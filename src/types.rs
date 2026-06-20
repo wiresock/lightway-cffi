@@ -47,6 +47,30 @@ pub enum he_return_code_t {
 }
 
 impl he_return_code_t {
+    /// Map a raw C integer back to a known return code, or `None` if it does
+    /// not correspond to any defined value.  Used by `he_return_code_name` so
+    /// that an out-of-range integer from C is handled safely rather than
+    /// reinterpreted as an invalid enum discriminant (which would be UB).
+    pub(crate) fn from_repr(v: i32) -> Option<Self> {
+        Some(match v {
+            0 => Self::HE_SUCCESS,
+            -1 => Self::HE_ERR_FAILED,
+            -2 => Self::HE_ERR_NULL_POINTER,
+            -3 => Self::HE_ERR_NO_MEMORY,
+            -4 => Self::HE_ERR_BUFFER_TOO_SMALL,
+            -5 => Self::HE_ERR_BAD_PARAM,
+            -6 => Self::HE_ERR_ACCESS_DENIED,
+            -7 => Self::HE_ERR_PAYLOAD_TOO_LARGE,
+            -8 => Self::HE_ERR_STRING_TOO_LONG,
+            -9 => Self::HE_CONNECTION_TIMED_OUT,
+            -10 => Self::HE_ERR_INCORRECT_PROTOCOL_VERSION,
+            -11 => Self::HE_ERR_SSL_ERROR,
+            -12 => Self::HE_ERR_CONF_NOT_SET,
+            -13 => Self::HE_ERR_INVALID_CONN_STATE,
+            _ => return None,
+        })
+    }
+
     /// Returns a static C string name for use in log messages, matching
     /// `he_return_code_name()`.
     pub(crate) fn as_cstr(self) -> &'static c_char {
@@ -223,30 +247,6 @@ pub struct he_expresslane_keys_t {
     pub self_key: [u8; 32],
     /// 256-bit AES/ChaCha key for packets **received** by this endpoint.
     pub peer_key: [u8; 32],
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Threat manager / packet filter
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Blocking mode for `he_domain_filter_t`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum he_domain_filter_blocking_mode_t {
-    /// Respond with NXDOMAIN.
-    HE_DOMAIN_FILTER_BLOCKING_MODE_NXDOMAIN = 0,
-    /// Respond with a zero IP (0.0.0.0).
-    HE_DOMAIN_FILTER_BLOCKING_MODE_ZERO_IP = 1,
-}
-
-/// Decision returned by a `he_packet_filter_handler_t`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum he_packet_filter_decision_t {
-    /// Pass the packet through unmodified.
-    HE_PACKET_FILTER_DECISION_PASS = 0,
-    /// Drop / block the packet.
-    HE_PACKET_FILTER_DECISION_BLOCK = 1,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

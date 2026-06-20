@@ -9,17 +9,17 @@
 use lightway_core::{Event, EventCallback, ExpresslaneState, State};
 
 use crate::conn::{
-    he_conn_t, he_event_cb_t, he_expresslane_state_change_cb_t, he_pmtud_state_change_cb_t,
-    he_state_change_cb_t,
+    he_conn_t, he_event_cb_t, he_expresslane_state_change_cb_t, he_state_change_cb_t,
 };
 use crate::types::{he_conn_event_t, he_conn_state_t, he_expresslane_state_t};
 
 /// Carries the C callback pointers required to deliver events.
+///
+/// PMTUD state changes are intentionally absent: the pinned `lightway-core`
+/// does not surface them through `Event`, and this shim does not drive PMTUD.
 pub(crate) struct CffiEventCallback {
     pub(crate) state_change_cb: Option<he_state_change_cb_t>,
     pub(crate) event_cb: Option<he_event_cb_t>,
-    #[allow(dead_code)]
-    pub(crate) pmtud_state_change_cb: Option<he_pmtud_state_change_cb_t>,
     pub(crate) expresslane_state_change_cb: Option<he_expresslane_state_change_cb_t>,
     /// Raw back-pointer to the inlined `he_conn_t` inside `he_client_t`.
     /// Valid for the lifetime of the connection.

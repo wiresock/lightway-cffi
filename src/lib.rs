@@ -10,8 +10,10 @@
 // enum variants (HE_SUCCESS etc.) by convention — suppress Rust style lints.
 #![allow(non_camel_case_types, non_upper_case_globals, clippy::upper_case_acronyms)]
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod cffi_event;
 pub mod cffi_expresslane;
@@ -19,7 +21,6 @@ pub mod cffi_io;
 pub mod cffi_ip_config;
 pub mod cffi_state;
 pub mod conn;
-pub mod threat_manager;
 pub mod types;
 mod version;
 
@@ -40,6 +41,84 @@ use conn::{he_client_t, he_conn_t};
 use types::*;
 
 // ──────────────────────────────────────────────────────────────────────────────
+// FFI boundary helpers: panic isolation + re-entrancy-aware locking
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Run an FFI entry-point body, converting any panic into `default` instead of
+/// letting it unwind across the C ABI boundary (which aborts the process).
+///
+/// Wraps the body in [`AssertUnwindSafe`]: the entry points only capture raw
+/// pointers and `Copy` scalars, and any `&mut he_client_t` is created *inside*
+/// the closure (under the lock), so there is no broken invariant to leak.
+#[inline]
+fn ffi_guard<R>(default: R, f: impl FnOnce() -> R) -> R {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
+
+static NEXT_THREAD_TOKEN: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    /// A process-unique, non-zero token for the current thread.
+    static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn current_thread_token() -> u64 {
+    THREAD_TOKEN.with(|t| *t)
+}
+
+/// Clears the per-client lock-owner token on drop, including during a panic
+/// unwind, so a future call on the same thread is not mistaken for re-entrancy.
+struct OwnerReset<'a>(&'a AtomicU64);
+impl Drop for OwnerReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+/// Acquire the per-client lock and invoke `f` with an exclusive reference.
+///
+/// Returns `Err(HE_ERR_NULL_POINTER)` if `client` is null and
+/// `Err(HE_ERR_INVALID_CONN_STATE)` if the current thread already holds the
+/// lock — i.e. a C callback (fired while the lock is held) tried to re-enter a
+/// locking API.  Re-entering would dead-lock the non-reentrant mutex and alias
+/// the outstanding `&mut he_client_t`, so it is rejected rather than performed.
+///
+/// # Safety
+/// `client` must be null or a valid pointer from `he_client_create` whose
+/// `conn.arc_lock` / `conn.lock_owner` were initialised by `he_client_t::new()`.
+/// `f` must not let any reference derived from `&mut he_client_t` escape.
+unsafe fn lock_client<F, R>(client: *mut he_client_t, f: F) -> Result<R, he_return_code_t>
+where
+    F: FnOnce(&mut he_client_t) -> R,
+{
+    if client.is_null() {
+        return Err(he_return_code_t::HE_ERR_NULL_POINTER);
+    }
+    // SAFETY: client is non-null (checked) and valid per the caller contract.
+    // Clone the lock/owner Arcs via the raw pointer *before* creating any
+    // reference into the allocation, so the guard's borrow never overlaps the
+    // `&mut he_client_t` handed to the closure.
+    let (arc_lock, owner) = unsafe { ((*client).conn.arc_lock.clone(), (*client).conn.lock_owner.clone()) };
+
+    let me = current_thread_token();
+    if owner.load(Ordering::Acquire) == me {
+        return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+    }
+
+    let guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
+    owner.store(me, Ordering::Release);
+    // Cleared on scope exit (and on panic) before `guard` is released.
+    let _reset = OwnerReset(&owner);
+
+    // SAFETY: the lock is held and re-entrancy was rejected above, so this is
+    // the only live reference into the allocation.
+    let out = f(unsafe { &mut *client });
+    drop(_reset);
+    drop(guard);
+    Ok(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Connection-info snapshot helper
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -52,21 +131,32 @@ fn sync_conn_info(client: &mut he_client_t) {
     let Some(ref mut connection) = client.connection else {
         return;
     };
-    // Map wolfssl ProtocolVersion → our C enum
-    let proto = match connection.tls_protocol_version() {
-        ProtocolVersion::DtlsV1_2 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_2,
-        ProtocolVersion::DtlsV1_3 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_3,
-        ProtocolVersion::TlsV1_2 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_2,
-        ProtocolVersion::TlsV1_3 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_3,
-        _ => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE,
-    };
-    client.conn.current_protocol = proto;
 
-    if let Some(curve) = connection.current_curve() {
-        client.conn.curve_name = CString::new(curve).ok();
+    // Protocol / cipher / curve are immutable once the handshake has progressed
+    // far enough to expose them.  Capture each *exactly once* so that:
+    //   * the `*const c_char` handed to C by `he_conn_get_cipher_name` /
+    //     `he_conn_get_curve_name` stays valid for the connection's lifetime
+    //     instead of being freed and reallocated on every packet (a
+    //     use-after-free for any pointer C had already cached), and
+    //   * the hot data path performs no per-packet allocation once Online.
+    // These fields are reset by `he_client_connect` so a reconnect re-syncs.
+    if client.conn.current_protocol == he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE {
+        // Map wolfssl ProtocolVersion → our C enum
+        let proto = match connection.tls_protocol_version() {
+            ProtocolVersion::DtlsV1_2 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_2,
+            ProtocolVersion::DtlsV1_3 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_3,
+            ProtocolVersion::TlsV1_2 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_2,
+            ProtocolVersion::TlsV1_3 => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_3,
+            _ => he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE,
+        };
+        client.conn.current_protocol = proto;
     }
-    if let Some(cipher) = connection.current_cipher() {
-        client.conn.cipher_name = CString::new(cipher).ok();
+
+    if client.conn.curve_name.is_none() {
+        client.conn.curve_name = connection.current_curve().and_then(|c| CString::new(c).ok());
+    }
+    if client.conn.cipher_name.is_none() {
+        client.conn.cipher_name = connection.current_cipher().and_then(|c| CString::new(c).ok());
     }
 }
 
@@ -94,27 +184,37 @@ pub extern "C" fn he_wolfssl_version() -> *const c_char {
 
 /// Return a static NUL-terminated name for a return code, suitable for logging.
 ///
+/// Takes the raw integer value (not the `he_return_code_t` enum) so that an
+/// out-of-range value from C is reported as `"HE_ERR_UNKNOWN"` rather than
+/// being reinterpreted as an invalid enum discriminant (which would be UB).
+///
 /// # Safety
 /// Always returns a valid, non-null pointer regardless of the value passed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn he_return_code_name(code: he_return_code_t) -> *const c_char {
-    code.as_cstr()
+pub unsafe extern "C" fn he_return_code_name(code: c_int) -> *const c_char {
+    match he_return_code_t::from_repr(code) {
+        Some(c) => c.as_cstr() as *const c_char,
+        None => c"HE_ERR_UNKNOWN".as_ptr(),
+    }
 }
 
 /// Return a static NUL-terminated name for a connection protocol.
 ///
+/// Takes the raw integer value (not the `he_connection_protocol_t` enum) so an
+/// out-of-range value from C is reported as `"unknown"` rather than triggering
+/// UB on an invalid enum discriminant.
+///
 /// # Safety
 /// Always returns a valid, non-null pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn he_connection_protocol_name(
-    protocol: he_connection_protocol_t,
-) -> *const c_char {
+pub unsafe extern "C" fn he_connection_protocol_name(protocol: c_int) -> *const c_char {
     let s: &[u8] = match protocol {
-        he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE => b"none\0",
-        he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_2 => b"DTLS 1.2\0",
-        he_connection_protocol_t::HE_CONNECTION_PROTOCOL_DTLS_1_3 => b"DTLS 1.3\0",
-        he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_2 => b"TLS 1.2\0",
-        he_connection_protocol_t::HE_CONNECTION_PROTOCOL_TLS_1_3 => b"TLS 1.3\0",
+        0 => b"none\0",
+        1 => b"DTLS 1.2\0",
+        2 => b"DTLS 1.3\0",
+        3 => b"TLS 1.2\0",
+        4 => b"TLS 1.3\0",
+        _ => b"unknown\0",
     };
     // SAFETY: all byte literals above are valid NUL-terminated ASCII.
     unsafe { &*(s.as_ptr() as *const c_char) }
@@ -226,8 +326,14 @@ pub unsafe extern "C" fn he_client_is_config_valid(
     if !has_user_pass && !has_token {
         return he_return_code_t::HE_ERR_CONF_NOT_SET;
     }
-    // Require at least one write callback
+    // Require the outside-write callback (mandatory in he_client_connect).
     if client.ssl_ctx.outside_write_cb.is_none() {
+        return he_return_code_t::HE_ERR_CONF_NOT_SET;
+    }
+    // Require the CA certificate — he_client_connect rejects its absence, so
+    // validation must agree or it would report a config as ready that cannot
+    // actually connect.
+    if client.ssl_ctx.ca_cert.is_none() {
         return he_return_code_t::HE_ERR_CONF_NOT_SET;
     }
     he_return_code_t::HE_SUCCESS
@@ -244,17 +350,26 @@ pub unsafe extern "C" fn he_client_is_config_valid(
 /// `client` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_return_code_t {
-    if client.is_null() {
-        return he_return_code_t::HE_ERR_NULL_POINTER;
+    // SAFETY: `client` is null-checked and serialised by lock_client; the body
+    // runs with the per-client lock held.  ffi_guard prevents a panic (e.g. from
+    // lightway-core or a C callback) from unwinding across the C ABI boundary.
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // SAFETY: lock_client null-checks `client`, serialises access, and
+        // rejects re-entrancy before creating the &mut he_client_t.
+        match unsafe { lock_client(client, client_connect_locked) } {
+            Ok(code) | Err(code) => code,
+        }
+    })
+}
+
+/// Body of [`he_client_connect`], run with the per-client lock held.
+fn client_connect_locked(client: &mut he_client_t) -> he_return_code_t {
+    // Reject a second connect on an already-live connection: silently
+    // overwriting `client.connection` would drop the live tunnel without a
+    // graceful goodbye and leak the server-side session.
+    if client.connection.is_some() {
+        return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
     }
-    // SAFETY: null check above; pointer is valid for the call duration.
-    // Clone arc_lock via raw pointer before creating &mut he_client_t so that
-    // the MutexGuard's internal borrow (into the Arc allocation) and the
-    // &mut he_client_t reference do not overlap.
-    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
-    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: null check above; lock is held; pointer is valid for this call.
-    let client = unsafe { &mut *client };
 
     // ── 1. Validate ────────────────────────────────────────────────────────
     let Some(outside_write_cb) = client.ssl_ctx.outside_write_cb else {
@@ -362,7 +477,6 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
     let event_cb = Box::new(CffiEventCallback {
         state_change_cb: client.ssl_ctx.state_change_cb,
         event_cb: client.ssl_ctx.event_cb,
-        pmtud_state_change_cb: client.ssl_ctx.pmtud_state_change_cb,
         expresslane_state_change_cb: client.ssl_ctx.expresslane_state_change_cb,
         conn_ptr,
         ctx,
@@ -404,6 +518,15 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
 
     client.connection = Some(connection);
 
+    // Fresh connection: clear cached crypto info (written once by
+    // sync_conn_info and otherwise never reset) so a reconnect re-captures it,
+    // and reflect the configured outside MTU in the "negotiated" field that
+    // `he_conn_get_outside_mtu` returns.
+    client.conn.current_protocol = he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE;
+    client.conn.curve_name = None;
+    client.conn.cipher_name = None;
+    client.conn.outside_mtu_negotiated = client.conn.outside_mtu;
+
     // `Connection::new()` initialises `state` to `State::Connecting` directly
     // (not via `set_state()`), so the EventCallback is never invoked for the
     // initial Connecting transition.  Synthesise it here so the C-side state
@@ -429,18 +552,27 @@ pub unsafe extern "C" fn he_client_connect(client: *mut he_client_t) -> he_retur
 /// `client` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_client_disconnect(client: *mut he_client_t) -> he_return_code_t {
-    if client.is_null() {
-        return he_return_code_t::HE_ERR_NULL_POINTER;
-    }
-    // SAFETY: null check above; pointer is valid for the call duration.
-    // Clone arc_lock via raw pointer before creating &mut he_client_t so that
-    // the MutexGuard's internal borrow and the &mut he_client_t do not overlap.
-    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
-    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: null check above; lock is held; pointer is valid for this call.
-    let client = unsafe { &mut *client };
+    // SAFETY: `client` is null-checked and serialised by lock_client; ffi_guard
+    // contains any panic from the goodbye path or a state-change callback.
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // SAFETY: lock_client null-checks `client`, serialises access, and
+        // rejects re-entrancy before creating the &mut he_client_t.
+        match unsafe { lock_client(client, client_disconnect_locked) } {
+            Ok(code) | Err(code) => code,
+        }
+    })
+}
 
-    // Drive a graceful TLS goodbye if the Connection is live.
+/// Body of [`he_client_disconnect`], run with the per-client lock held.
+fn client_disconnect_locked(client: &mut he_client_t) -> he_return_code_t {
+    // Drive a graceful TLS goodbye if the Connection is live.  For an Online
+    // connection, `Connection::disconnect()` itself fires StateChanged
+    // (Disconnecting → Disconnected) through the EventCallback, which updates
+    // `client.conn.state`.  The `already_disconnected` guard below then sees
+    // that and skips the manual synthesis, so the C state-change callback is
+    // not invoked twice.  The manual path only runs when the core did *not*
+    // emit those transitions (e.g. disconnect() returned InvalidState because
+    // the handshake was still in progress, or no Connection was ever built).
     if let Some(ref mut connection) = client.connection {
         let _ = connection.disconnect();
     }
@@ -544,6 +676,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_network_config_ipv4_cb(
 
 /// Set the server-config callback.
 ///
+/// Accepted for source/ABI compatibility, but this shim does not currently
+/// deliver server-config data, so the callback is stored and never invoked.
+///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
@@ -595,6 +730,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_event_cb(
 
 /// Set the username/password authentication callback (server role).
 ///
+/// Accepted for source/ABI compatibility with the OSS C library.  This is a
+/// client-only shim, so the callback is stored but never invoked.
+///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
@@ -611,6 +749,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_cb(
 }
 
 /// Set the auth-token callback (server role).
+///
+/// Accepted for source/ABI compatibility with the OSS C library.  This is a
+/// client-only shim, so the callback is stored but never invoked.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
@@ -629,6 +770,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_token_cb(
 
 /// Set the auth-buffer callback (server role).
 ///
+/// Accepted for source/ABI compatibility with the OSS C library.  This is a
+/// client-only shim, so the callback is stored but never invoked.
+///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
@@ -645,6 +789,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_auth_buf_cb(
 }
 
 /// Set the populate-network-config callback (server role).
+///
+/// Accepted for source/ABI compatibility with the OSS C library.  This is a
+/// client-only shim, so the callback is stored but never invoked.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
@@ -663,6 +810,10 @@ pub unsafe extern "C" fn he_ssl_ctx_set_populate_network_config_ipv4_cb(
 
 /// Set the PMTUD state-change callback.
 ///
+/// NOTE: PMTUD is not currently driven by this shim, so this callback is stored
+/// but never invoked.  Accepted for ABI compatibility; see
+/// `he_conn_get_effective_pmtu`.
+///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
@@ -679,6 +830,9 @@ pub unsafe extern "C" fn he_ssl_ctx_set_pmtud_state_change_cb(
 }
 
 /// Set the PMTUD timer callback.
+///
+/// NOTE: PMTUD is not currently driven by this shim, so this callback is stored
+/// but never invoked.  Accepted for ABI compatibility.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
@@ -735,10 +889,13 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
     // SAFETY: null check above; server_dn is a valid NUL-terminated C string
     // as required by the function's documented contract.
     let s = unsafe { CStr::from_ptr(server_dn) };
+    // The DN is later handed to lightway-core as &str, so validate UTF-8 here.
+    // `s` is already a CStr (NUL-terminated, no interior NUL), so clone it with
+    // to_owned() rather than re-scanning and reallocating via CString::new.
     match s.to_str() {
-        Ok(s) => {
+        Ok(_) => {
             // SAFETY: null check above; ssl_ctx is valid for this call.
-            unsafe { (*ssl_ctx).server_dn = Some(CString::new(s).unwrap()) };
+            unsafe { (*ssl_ctx).server_dn = Some(s.to_owned()) };
             he_return_code_t::HE_SUCCESS
         }
         Err(_) => he_return_code_t::HE_ERR_BAD_PARAM,
@@ -746,6 +903,14 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
 }
 
 /// Enable or disable post-quantum cryptography.
+///
+/// The pinned `lightway-core` `ClientContextBuilder` exposes no API to select
+/// the client's TLS key-share groups, so this shim cannot actually enable PQC
+/// on a client connection.  Rather than silently accept the request and
+/// downgrade security without telling the caller, enabling PQC returns
+/// `HE_ERR_BAD_PARAM`; disabling it (the only behaviour we can honour) succeeds.
+/// If `lightway-core` later exposes a client PQC/group API, wire it in
+/// `client_connect_locked` and relax this check.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
@@ -757,8 +922,13 @@ pub unsafe extern "C" fn he_ssl_ctx_set_use_pqc(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    if use_pqc {
+        // Unsupported on the client with the pinned core — fail loudly instead
+        // of pretending it took effect.
+        return he_return_code_t::HE_ERR_BAD_PARAM;
+    }
     // SAFETY: null check above; ssl_ctx is valid for this call.
-    unsafe { (*ssl_ctx).use_pqc = use_pqc };
+    unsafe { (*ssl_ctx).use_pqc = false };
     he_return_code_t::HE_SUCCESS
 }
 
@@ -781,16 +951,25 @@ pub unsafe extern "C" fn he_ssl_ctx_set_use_chacha20(
 
 /// Set the connection transport type (datagram or stream).
 ///
+/// Takes the raw integer value so that an out-of-range value from C is rejected
+/// with `HE_ERR_BAD_PARAM` rather than stored as an invalid enum discriminant
+/// (which would be UB when later matched on the data path).
+///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_ssl_ctx_set_connection_type(
     ssl_ctx: *mut conn::he_ssl_ctx_t,
-    connection_type: he_connection_type_t,
+    connection_type: c_int,
 ) -> he_return_code_t {
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    let connection_type = match connection_type {
+        0 => he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM,
+        1 => he_connection_type_t::HE_CONNECTION_TYPE_STREAM,
+        _ => return he_return_code_t::HE_ERR_BAD_PARAM,
+    };
     // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).connection_type = connection_type };
     he_return_code_t::HE_SUCCESS
@@ -1025,10 +1204,13 @@ pub unsafe extern "C" fn he_conn_get_outside_mtu(conn: *const he_conn_t) -> u16 
 
 /// Get the effective path MTU determined by PMTUD.
 ///
-/// Returns 0 if PMTUD has not completed.
+/// NOTE: this shim does not currently drive Path MTU Discovery (the pinned
+/// `lightway-core` requires a PMTUD timer that is not wired here, and exposes no
+/// effective-MTU accessor), so this always returns 0.  Retained for ABI
+/// compatibility; treat 0 as "PMTUD not available".
 ///
 /// # Safety
-/// `conn` must be a valid non-null pointer.
+/// `conn` must be a valid non-null pointer or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_conn_get_effective_pmtu(conn: *const he_conn_t) -> u16 {
     if conn.is_null() {
@@ -1091,53 +1273,46 @@ pub unsafe extern "C" fn he_conn_get_curve_name(conn: *const he_conn_t) -> *cons
 
 /// Get the current session ID as a little-endian `uint64_t`.
 ///
-/// Returns `0` if no connection is active yet.
+/// Returns `0` if no connection is active yet, if `client` is null, or if
+/// called re-entrantly from within a callback that already holds the lock.
 ///
 /// # Safety
-/// `client` must be a valid non-null pointer.
+/// `client` must be null or a valid pointer from `he_client_create`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u64 {
-    if client.is_null() {
-        return 0;
-    }
-    // SAFETY: null check above; client is valid for this call.
-    // Clone arc_lock via raw pointer before creating &he_client_t to avoid
-    // the guard's borrow overlapping the struct reference.
-    let arc_lock = unsafe { (*client).conn.arc_lock.clone() };
-    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: null check above; lock is held; pointer is valid for this call.
-    let client = unsafe { &*client };
-    match client.connection {
-        Some(ref conn) => {
-            let sid = conn.session_id();
-            // SessionId is [u8; 8]; interpret as little-endian u64.
-            u64::from_le_bytes(
-                // SAFETY: SessionId is a [u8; 8] newtype; reading it as [u8; 8]
-            // is always valid and correctly sized.
-                unsafe { std::ptr::read(&sid as *const _ as *const [u8; 8]) }
-            )
+    ffi_guard(0, || {
+        // SAFETY: lock_client null-checks and serialises access; the cast to
+        // *mut is sound because we only read the client under the lock.
+        unsafe {
+            lock_client(client as *mut he_client_t, |client| {
+                match client.connection {
+                    // SessionId is a [u8; 8] newtype; read it via its safe
+                    // accessor and interpret the bytes as little-endian.
+                    Some(ref conn) => u64::from_le_bytes(*conn.session_id().as_bytes()),
+                    None => 0,
+                }
+            })
         }
-        None => 0,
-    }
+        .unwrap_or(0)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Data path
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Recover the owning [`he_client_t`] from a `*mut he_conn_t`, acquire its
-/// lock, and invoke `f` with a mutable reference to the client.
+/// Recover the owning [`he_client_t`] from a `*mut he_conn_t` and run `f` with
+/// an exclusive reference under the per-client lock (via [`lock_client`]).
 ///
 /// Returns `Err(HE_ERR_FAILED)` if `conn` is null or the back-pointer has not
-/// been initialised (i.e. `client_ptr` is null).
+/// been initialised, and `Err(HE_ERR_INVALID_CONN_STATE)` for a re-entrant call
+/// from within a callback (see [`lock_client`]).
 ///
 /// # Safety
 /// `conn` must be a valid, non-null pointer to a `he_conn_t` whose
 /// `client_ptr` field was set by `he_client_t::new()` and has not been freed.
 /// `f` must not let any reference derived from `&mut he_client_t` escape the
-/// closure (e.g. by returning or storing it), because the mutex guard is
-/// released when this function returns and any escaped reference would then
-/// alias unprotected data.
+/// closure, because the mutex guard is released when this function returns.
 #[inline]
 unsafe fn with_client<F, R>(conn: *mut he_conn_t, f: F) -> Result<R, he_return_code_t>
 where
@@ -1151,15 +1326,9 @@ where
     if client_ptr.is_null() {
         return Err(he_return_code_t::HE_ERR_FAILED);
     }
-    // SAFETY: conn is non-null (checked above). We clone arc_lock before creating
-    // &mut he_client_t so that no shared reference into the he_client_t allocation
-    // overlaps the mutable reference created below. We then lock via the clone to
-    // serialise access to the client state.
-    let arc_lock = unsafe { (*conn).arc_lock.clone() };
-    let _guard = arc_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: lock is held; no other &mut to this allocation can exist.
-    let client = unsafe { &mut *client_ptr };
-    Ok(f(client))
+    // SAFETY: client_ptr is the non-null owning allocation; lock_client clones
+    // the lock before creating the &mut, and rejects re-entrancy.
+    unsafe { lock_client(client_ptr, f) }
 }
 
 
@@ -1176,37 +1345,42 @@ pub unsafe extern "C" fn he_conn_outside_data_received(
     buffer: *mut u8,
     length: usize,
 ) -> he_return_code_t {
-    if conn.is_null() || buffer.is_null() {
-        return he_return_code_t::HE_ERR_NULL_POINTER;
-    }
-    // SAFETY: null check above; buffer points to `length` readable bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(buffer, length) };
-    let mut buf = BytesMut::from(bytes);
-    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
-    // client_ptr back-pointer was initialised by he_client_t::new().
-    // sync_conn_info runs inside the closure, under the lock.
-    match unsafe {
-        with_client(conn, |client| {
-            let connection_type = match client.ssl_ctx.connection_type {
-                he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM => ConnectionType::Datagram,
-                he_connection_type_t::HE_CONNECTION_TYPE_STREAM => ConnectionType::Stream,
-            };
-            let Some(ref mut connection) = client.connection else {
-                return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-            };
-            let pkt = OutsidePacket::Wire(&mut buf, connection_type);
-            let rc = match connection.outside_data_received(pkt) {
-                Ok(_) => he_return_code_t::HE_SUCCESS,
-                Err(e) if e.is_fatal(connection_type) => he_return_code_t::HE_ERR_FAILED,
-                Err(_) => he_return_code_t::HE_SUCCESS,
-            };
-            sync_conn_info(client);
-            rc
-        })
-    } {
-        Ok(r) => r,
-        Err(e) => e,
-    }
+    // ffi_guard: this path parses attacker-controlled wire bytes; contain any
+    // panic in lightway-core/wolfSSL rather than aborting the whole process.
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        if conn.is_null() || buffer.is_null() {
+            return he_return_code_t::HE_ERR_NULL_POINTER;
+        }
+        // SAFETY: null check above; buffer points to `length` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer, length) };
+        // lightway-core consumes an owned, growable buffer (it decrypts/parses
+        // in place), so a per-packet copy here is unavoidable with this API.
+        let mut buf = BytesMut::from(bytes);
+        // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
+        // client_ptr back-pointer was initialised by he_client_t::new().
+        // sync_conn_info runs inside the closure, under the lock.
+        match unsafe {
+            with_client(conn, |client| {
+                let connection_type = match client.ssl_ctx.connection_type {
+                    he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM => ConnectionType::Datagram,
+                    he_connection_type_t::HE_CONNECTION_TYPE_STREAM => ConnectionType::Stream,
+                };
+                let Some(ref mut connection) = client.connection else {
+                    return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
+                };
+                let pkt = OutsidePacket::Wire(&mut buf, connection_type);
+                let rc = match connection.outside_data_received(pkt) {
+                    Ok(_) => he_return_code_t::HE_SUCCESS,
+                    Err(e) if e.is_fatal(connection_type) => he_return_code_t::HE_ERR_FAILED,
+                    Err(_) => he_return_code_t::HE_SUCCESS,
+                };
+                sync_conn_info(client);
+                rc
+            })
+        } {
+            Ok(r) | Err(r) => r,
+        }
+    })
 }
 
 /// Feed a plaintext inner packet into the connection for encryption and
@@ -1223,34 +1397,36 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
     packet: *mut u8,
     length: usize,
 ) -> he_return_code_t {
-    if conn.is_null() || packet.is_null() {
-        return he_return_code_t::HE_ERR_NULL_POINTER;
-    }
-    // SAFETY: null check above; packet points to `length` readable bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(packet, length) };
-    let mut buf = BytesMut::from(bytes);
-    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
-    // client_ptr back-pointer was initialised by he_client_t::new().
-    // sync_conn_info runs inside the closure, under the lock.
-    match unsafe {
-        with_client(conn, |client| {
-            let Some(ref mut connection) = client.connection else {
-                return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
-            };
-            let rc = match connection.inside_data_received(&mut buf) {
-                Ok(()) => he_return_code_t::HE_SUCCESS,
-                Err(lightway_core::ConnectionError::InvalidState) => {
-                    he_return_code_t::HE_ERR_INVALID_CONN_STATE
-                }
-                Err(_) => he_return_code_t::HE_ERR_FAILED,
-            };
-            sync_conn_info(client);
-            rc
-        })
-    } {
-        Ok(r) => r,
-        Err(e) => e,
-    }
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        if conn.is_null() || packet.is_null() {
+            return he_return_code_t::HE_ERR_NULL_POINTER;
+        }
+        // SAFETY: null check above; packet points to `length` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(packet, length) };
+        // Owned, growable buffer required by lightway-core; copy is unavoidable.
+        let mut buf = BytesMut::from(bytes);
+        // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
+        // client_ptr back-pointer was initialised by he_client_t::new().
+        // sync_conn_info runs inside the closure, under the lock.
+        match unsafe {
+            with_client(conn, |client| {
+                let Some(ref mut connection) = client.connection else {
+                    return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
+                };
+                let rc = match connection.inside_data_received(&mut buf) {
+                    Ok(()) => he_return_code_t::HE_SUCCESS,
+                    Err(lightway_core::ConnectionError::InvalidState) => {
+                        he_return_code_t::HE_ERR_INVALID_CONN_STATE
+                    }
+                    Err(_) => he_return_code_t::HE_ERR_FAILED,
+                };
+                sync_conn_info(client);
+                rc
+            })
+        } {
+            Ok(r) | Err(r) => r,
+        }
+    })
 }
 
 /// Nudge the connection — retransmit handshake messages if the keepalive
@@ -1260,57 +1436,247 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
 /// `conn` must be a valid non-null pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t {
-    if conn.is_null() {
-        return he_return_code_t::HE_ERR_NULL_POINTER;
+    // SAFETY: conn (when non-null) points to a he_conn_t whose client_ptr
+    // back-pointer was initialised by he_client_t::new().  All reads/writes to
+    // client state (including conn.nudge_time_ms) happen inside the closure,
+    // under the per-client mutex (he_conn_t::arc_lock).
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        if conn.is_null() {
+            return he_return_code_t::HE_ERR_NULL_POINTER;
+        }
+        // SAFETY: conn is non-null (checked above) and carries the client
+        // back-pointer set by he_client_t::new(); with_client recovers and locks
+        // the owning client before handing out the &mut.
+        match unsafe {
+            with_client(conn, |client| {
+                // Capture now after acquiring the lock so tick decisions and
+                // nudge_ms computations reflect a consistent, current instant.
+                let now = std::time::Instant::now();
+                let Some(ref mut connection) = client.connection else {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                };
+                let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
+                if should_tick {
+                    connection.app_state_mut().next_tick = None;
+                    match connection.tick(TickType::ConnectionTick) {
+                        Ok(()) => {}
+                        Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
+                    }
+                    sync_conn_info(client);
+                    // Compute nudge_ms using the pre-captured `now` for consistency.
+                    let nudge_ms = client
+                        .connection
+                        .as_ref()
+                        .and_then(|c| c.app_state().next_tick)
+                        .map(|t| {
+                            let remaining = t.saturating_duration_since(now);
+                            remaining.as_millis().min(i32::MAX as u128) as i32
+                        })
+                        .unwrap_or(0);
+                    client.conn.nudge_time_ms = nudge_ms;
+                } else {
+                    let nudge_ms = connection
+                        .app_state()
+                        .next_tick
+                        .map(|t| {
+                            let remaining = t.saturating_duration_since(now);
+                            remaining.as_millis().min(i32::MAX as u128) as i32
+                        })
+                        .unwrap_or(0);
+                    client.conn.nudge_time_ms = nudge_ms;
+                }
+                Ok(())
+            })
+        } {
+            Ok(Ok(())) => he_return_code_t::HE_SUCCESS,
+            Ok(Err(e)) => e,
+            Err(e) => e,
+        }
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    // Test bodies call our own FFI entry points with locally-constructed, valid
+    // pointers; the safety contracts are self-evident, so don't require a
+    // per-block SAFETY comment here.
+    #![allow(clippy::undocumented_unsafe_blocks)]
+
+    use super::*;
+    use crate::conn::he_conn_t;
+
+    /// Minimal `outside_write_cb` used to satisfy config validation.
+    unsafe extern "C" fn dummy_outside_write(
+        _conn: *mut he_conn_t,
+        _packet: *mut u8,
+        _len: usize,
+        _ctx: *mut c_void,
+    ) -> he_return_code_t {
+        he_return_code_t::HE_SUCCESS
     }
 
-    // SAFETY: conn is non-null (checked above) and points to a he_conn_t whose
-    // client_ptr back-pointer was initialised by he_client_t::new().
-    // All reads/writes to client state (including conn.nudge_time_ms) happen
-    // inside the closure, under the per-client mutex (he_conn_t::arc_lock).
-    match unsafe {
-        with_client(conn, |client| {
-            // Capture now after acquiring the lock so tick decisions and
-            // nudge_ms computations reflect a consistent, current instant.
-            let now = std::time::Instant::now();
-            let Some(ref mut connection) = client.connection else {
-                return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
-            };
-            let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
-            if should_tick {
-                connection.app_state_mut().next_tick = None;
-                match connection.tick(TickType::ConnectionTick) {
-                    Ok(()) => {}
-                    Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
-                }
-                sync_conn_info(client);
-                // Compute nudge_ms using the pre-captured `now` for consistency.
-                let nudge_ms = client
-                    .connection
-                    .as_ref()
-                    .and_then(|c| c.app_state().next_tick)
-                    .map(|t| {
-                        let remaining = t.saturating_duration_since(now);
-                        remaining.as_millis().min(i32::MAX as u128) as i32
-                    })
-                    .unwrap_or(0);
-                client.conn.nudge_time_ms = nudge_ms;
-            } else {
-                let nudge_ms = connection
-                    .app_state()
-                    .next_tick
-                    .map(|t| {
-                        let remaining = t.saturating_duration_since(now);
-                        remaining.as_millis().min(i32::MAX as u128) as i32
-                    })
-                    .unwrap_or(0);
-                client.conn.nudge_time_ms = nudge_ms;
-            }
-            Ok(())
-        })
-    } {
-        Ok(Ok(())) => he_return_code_t::HE_SUCCESS,
-        Ok(Err(e)) => e,
-        Err(e) => e,
+    #[test]
+    fn create_get_destroy_roundtrip() {
+        unsafe {
+            let c = he_client_create();
+            assert!(!c.is_null());
+            let conn = he_client_get_conn(c);
+            assert!(!conn.is_null());
+            // The back-pointer recovers the owning client …
+            assert_eq!((*conn).client_ptr, c);
+            // … and the conn pointer is stable across calls.
+            assert_eq!(he_client_get_conn(c), conn);
+            assert!(!he_client_get_ssl_ctx(c).is_null());
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn accessors_handle_null() {
+        unsafe {
+            assert!(he_client_get_conn(std::ptr::null_mut()).is_null());
+            assert!(he_client_get_ssl_ctx(std::ptr::null_mut()).is_null());
+            assert_eq!(he_conn_get_nudge_time(std::ptr::null()), 0);
+            assert_eq!(he_conn_get_outside_mtu(std::ptr::null()), 0);
+            assert_eq!(he_conn_get_effective_pmtu(std::ptr::null()), 0);
+            assert!(he_conn_get_cipher_name(std::ptr::null()).is_null());
+            assert!(he_conn_get_curve_name(std::ptr::null()).is_null());
+            assert_eq!(he_conn_get_session_id(std::ptr::null()), 0);
+            assert_eq!(
+                he_conn_get_current_protocol(std::ptr::null()),
+                he_connection_protocol_t::HE_CONNECTION_PROTOCOL_NONE
+            );
+        }
+    }
+
+    #[test]
+    fn is_config_valid_requires_auth_writecb_and_ca() {
+        unsafe {
+            assert_eq!(
+                he_client_is_config_valid(std::ptr::null()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            let c = he_client_create();
+            assert_eq!(he_client_is_config_valid(c), he_return_code_t::HE_ERR_CONF_NOT_SET);
+
+            let ssl = he_client_get_ssl_ctx(c);
+            let conn = he_client_get_conn(c);
+            let token = b"token-bytes";
+            he_conn_set_auth_token(conn, token.as_ptr(), token.len());
+            // auth alone is insufficient
+            assert_eq!(he_client_is_config_valid(c), he_return_code_t::HE_ERR_CONF_NOT_SET);
+            he_ssl_ctx_set_outside_write_cb(ssl, dummy_outside_write);
+            // still missing the CA certificate
+            assert_eq!(he_client_is_config_valid(c), he_return_code_t::HE_ERR_CONF_NOT_SET);
+            let ca = b"-----DUMMY CA-----";
+            he_ssl_ctx_set_ca(ssl, ca.as_ptr(), ca.len());
+            assert_eq!(he_client_is_config_valid(c), he_return_code_t::HE_SUCCESS);
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn return_code_name_handles_out_of_range() {
+        unsafe {
+            assert_eq!(CStr::from_ptr(he_return_code_name(0)).to_bytes(), b"HE_SUCCESS");
+            assert_eq!(
+                CStr::from_ptr(he_return_code_name(-13)).to_bytes(),
+                b"HE_ERR_INVALID_CONN_STATE"
+            );
+            // Out-of-range must be handled, not treated as an invalid discriminant.
+            assert_eq!(CStr::from_ptr(he_return_code_name(9999)).to_bytes(), b"HE_ERR_UNKNOWN");
+        }
+    }
+
+    #[test]
+    fn protocol_name_handles_out_of_range() {
+        unsafe {
+            assert_eq!(CStr::from_ptr(he_connection_protocol_name(0)).to_bytes(), b"none");
+            assert_eq!(CStr::from_ptr(he_connection_protocol_name(2)).to_bytes(), b"DTLS 1.3");
+            assert_eq!(CStr::from_ptr(he_connection_protocol_name(123)).to_bytes(), b"unknown");
+        }
+    }
+
+    #[test]
+    fn use_pqc_enable_is_rejected() {
+        unsafe {
+            let c = he_client_create();
+            let ssl = he_client_get_ssl_ctx(c);
+            assert_eq!(he_ssl_ctx_set_use_pqc(ssl, true), he_return_code_t::HE_ERR_BAD_PARAM);
+            assert_eq!(he_ssl_ctx_set_use_pqc(ssl, false), he_return_code_t::HE_SUCCESS);
+            assert_eq!(
+                he_ssl_ctx_set_use_pqc(std::ptr::null_mut(), false),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn connection_type_is_validated() {
+        unsafe {
+            let c = he_client_create();
+            let ssl = he_client_get_ssl_ctx(c);
+            assert_eq!(he_ssl_ctx_set_connection_type(ssl, 0), he_return_code_t::HE_SUCCESS);
+            assert_eq!(he_ssl_ctx_set_connection_type(ssl, 1), he_return_code_t::HE_SUCCESS);
+            assert_eq!(he_ssl_ctx_set_connection_type(ssl, 2), he_return_code_t::HE_ERR_BAD_PARAM);
+            assert_eq!(he_ssl_ctx_set_connection_type(ssl, -1), he_return_code_t::HE_ERR_BAD_PARAM);
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn credential_setters_roundtrip() {
+        unsafe {
+            let c = he_client_create();
+            let conn = he_client_get_conn(c);
+            assert_eq!(he_conn_set_username(conn, c"alice".as_ptr()), he_return_code_t::HE_SUCCESS);
+            assert_eq!(he_conn_set_password(conn, c"secret".as_ptr()), he_return_code_t::HE_SUCCESS);
+            assert_eq!((*conn).username.as_deref(), Some(c"alice"));
+            assert_eq!((*conn).password.as_deref(), Some(c"secret"));
+            assert_eq!(
+                he_conn_set_username(conn, std::ptr::null()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn outside_mtu_setter_roundtrip() {
+        unsafe {
+            let c = he_client_create();
+            let conn = he_client_get_conn(c);
+            assert_eq!(he_conn_set_outside_mtu(conn, 1400), he_return_code_t::HE_SUCCESS);
+            assert_eq!((*conn).outside_mtu, 1400);
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn data_path_without_connection_is_rejected() {
+        unsafe {
+            let c = he_client_create();
+            let conn = he_client_get_conn(c);
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                he_conn_outside_data_received(conn, buf.as_mut_ptr(), buf.len()),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
+            );
+            assert_eq!(
+                he_conn_inside_packet_received(conn, buf.as_mut_ptr(), buf.len()),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
+            );
+            assert_eq!(he_conn_nudge(conn), he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+            assert_eq!(
+                he_conn_outside_data_received(conn, std::ptr::null_mut(), 0),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            he_client_destroy(c);
+        }
     }
 }
