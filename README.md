@@ -19,6 +19,23 @@ changes to their existing `lightway_tunnel.h` call sites.
 - Panics from `lightway-core` / wolfSSL or from C callbacks are contained at the FFI boundary
   (returned as `HE_ERR_FAILED`) instead of aborting the process.
 
+## Threading model
+
+What is and isn't serialised is deliberately narrow:
+
+- **Serialised:** the data-path calls `he_conn_outside_data_received`,
+  `he_conn_inside_packet_received` and `he_conn_nudge`, plus `he_client_connect` /
+  `he_client_disconnect` / `he_conn_get_session_id`. These may be called from multiple threads;
+  the library serialises them on a per-client lock. Re-entering one from within a callback is
+  rejected with `HE_ERR_INVALID_CONN_STATE`.
+- **NOT serialised:** the configuration setters (`he_conn_set_*`, `he_ssl_ctx_set_*`) and the
+  plain getters (`he_conn_get_outside_mtu`, `…_cipher_name`, etc.) touch the client without the
+  lock. Configure the client from a single thread before `he_client_connect`, and read getters
+  after `HE_STATE_ONLINE` (by which point their values are fixed).
+- **`he_client_destroy` is not serialised at all.** The caller must ensure every thread that
+  could call into this client has quiesced before destroying it; destroying while a data-path
+  call is in flight (or calling the data path after destroy) is a use-after-free.
+
 ## Limitations
 
 - **Post-quantum crypto:** the pinned `lightway-core` `ClientContextBuilder` exposes no

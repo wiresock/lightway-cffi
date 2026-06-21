@@ -160,6 +160,34 @@ fn sync_conn_info(client: &mut he_client_t) {
     }
 }
 
+/// Tear down a connection that hit a fatal wire error: drop the live
+/// `Connection` and deliver a single `HE_STATE_DISCONNECTED` transition so the
+/// C side observes the death through its normal state-change channel rather
+/// than only via a return code on a connection that is silently left for dead.
+///
+/// Must be called while the per-client lock is held.
+fn fatal_disconnect(client: &mut he_client_t) {
+    // Already torn down (e.g. lightway-core already signalled Disconnected):
+    // just make sure the live Connection is dropped.
+    if client.conn.state == he_conn_state_t::HE_STATE_DISCONNECTED {
+        client.connection = None;
+        return;
+    }
+    client.conn.state = he_conn_state_t::HE_STATE_DISCONNECTED;
+    let conn_ptr: *mut he_conn_t = &mut client.conn;
+    let ctx = client.conn.context;
+    if let Some(cb) = client.ssl_ctx.state_change_cb {
+        // SAFETY: conn_ptr points into the he_client_t allocation (stable for
+        // the client's lifetime) and ctx is caller-managed; both stay valid
+        // independent of the live Connection. The state value is a plain C enum.
+        unsafe { cb(conn_ptr, he_conn_state_t::HE_STATE_DISCONNECTED, ctx) };
+    }
+    // Drop the live Connection only *after* the callback, matching the ordering
+    // in client_disconnect_locked so the connection stays queryable during the
+    // transition.
+    client.connection = None;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Version / misc
 // ──────────────────────────────────────────────────────────────────────────────
@@ -261,12 +289,23 @@ pub unsafe extern "C" fn he_client_create() -> *mut he_client_t {
 ///
 /// # Safety
 /// `client` must be a valid pointer obtained from `he_client_create` and must
-/// not be used after this call.  The caller is responsible for ensuring that
-/// no other thread is concurrently calling any `he_*` function on the same
-/// client; destruction is not internally serialised.  In particular,
-/// `he_client_destroy` must not be called from within any callback that is
-/// invoked while the per-client mutex is held (e.g. from a state-change
-/// callback triggered by `he_client_disconnect`).
+/// not be used after this call.
+///
+/// Destruction is **not** internally serialised against other calls: the
+/// per-client lock cannot protect this because the lock lives *inside* the
+/// allocation being freed (and the data path reaches it by dereferencing a
+/// `*mut he_conn_t` that points into the same allocation). The caller MUST
+/// therefore guarantee that every thread which could call any `he_*` function
+/// on this client — in particular the data-path calls
+/// `he_conn_outside_data_received`, `he_conn_inside_packet_received` and
+/// `he_conn_nudge` — has fully quiesced before calling `he_client_destroy`.
+/// Calling a data-path function concurrently with (or after) destruction is a
+/// use-after-free. In particular, `he_client_destroy` must not be called from
+/// within any callback that runs while the per-client mutex is held (e.g. from
+/// a state-change callback triggered by `he_client_disconnect`).
+///
+/// Enforcing this in-library would require a reference-counted handle (so the
+/// allocation outlives in-flight calls); that is a deliberate future change.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_client_destroy(client: *mut he_client_t) {
     if !client.is_null() {
@@ -1237,7 +1276,11 @@ pub unsafe extern "C" fn he_conn_get_current_protocol(
 
 /// Get the negotiated cipher suite name, or null if not yet negotiated.
 ///
-/// The returned pointer is valid as long as the connection object is alive.
+/// The value is captured once when the handshake exposes it and is then stable
+/// for the connection's lifetime, so the returned pointer remains valid. This
+/// getter takes no lock (and so is safe to call from a callback), but for that
+/// reason it should be read after the `HE_STATE_ONLINE` transition, by which
+/// point the value is fixed.
 ///
 /// # Safety
 /// `conn` must be a valid non-null pointer or null.
@@ -1255,7 +1298,8 @@ pub unsafe extern "C" fn he_conn_get_cipher_name(conn: *const he_conn_t) -> *con
 
 /// Get the TLS curve name, or null if not yet negotiated.
 ///
-/// The returned pointer is valid as long as the connection object is alive.
+/// As with `he_conn_get_cipher_name`, the value is captured once and stable for
+/// the connection's lifetime; read it after `HE_STATE_ONLINE`.
 ///
 /// # Safety
 /// `conn` must be a valid non-null pointer or null.
@@ -1361,20 +1405,31 @@ pub unsafe extern "C" fn he_conn_outside_data_received(
         // sync_conn_info runs inside the closure, under the lock.
         match unsafe {
             with_client(conn, |client| {
-                let connection_type = match client.ssl_ctx.connection_type {
-                    he_connection_type_t::HE_CONNECTION_TYPE_DATAGRAM => ConnectionType::Datagram,
-                    he_connection_type_t::HE_CONNECTION_TYPE_STREAM => ConnectionType::Stream,
-                };
                 let Some(ref mut connection) = client.connection else {
                     return he_return_code_t::HE_ERR_INVALID_CONN_STATE;
                 };
+                // Use the live connection's transport type rather than the
+                // mutable ssl_ctx copy, which a setter could change after
+                // connect and leave disagreeing with the actual connection.
+                let connection_type = connection.connection_type();
                 let pkt = OutsidePacket::Wire(&mut buf, connection_type);
+                let mut fatal = false;
                 let rc = match connection.outside_data_received(pkt) {
                     Ok(_) => he_return_code_t::HE_SUCCESS,
-                    Err(e) if e.is_fatal(connection_type) => he_return_code_t::HE_ERR_FAILED,
+                    Err(e) if e.is_fatal(connection_type) => {
+                        fatal = true;
+                        he_return_code_t::HE_ERR_FAILED
+                    }
                     Err(_) => he_return_code_t::HE_SUCCESS,
                 };
-                sync_conn_info(client);
+                // A fatal wire error means the tunnel is dead; tear it down and
+                // signal the C side instead of leaving a dead connection that
+                // every subsequent call would keep hitting.
+                if fatal {
+                    fatal_disconnect(client);
+                } else {
+                    sync_conn_info(client);
+                }
                 rc
             })
         } {
@@ -1676,6 +1731,71 @@ mod tests {
                 he_conn_outside_data_received(conn, std::ptr::null_mut(), 0),
                 he_return_code_t::HE_ERR_NULL_POINTER
             );
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn ffi_guard_contains_panic() {
+        // A panic inside the guarded body must be converted to the default
+        // return value, never unwound across the (simulated) FFI boundary.
+        // The default panic hook prints one line for the deliberate panic
+        // below; that is expected. We avoid mutating the global hook because it
+        // would race other tests running in parallel.
+        let r = ffi_guard(he_return_code_t::HE_ERR_FAILED, || -> he_return_code_t {
+            panic!("ffi_guard test panic (expected)")
+        });
+        assert_eq!(r, he_return_code_t::HE_ERR_FAILED);
+    }
+
+    #[test]
+    fn lock_client_rejects_reentrancy() {
+        unsafe {
+            let c = he_client_create();
+            // Re-entering a locking API on the same thread while the lock is
+            // held must be rejected, not dead-lock.
+            let inner = lock_client(c, |_client| lock_client(c, |_| ()).err());
+            assert_eq!(inner.unwrap(), Some(he_return_code_t::HE_ERR_INVALID_CONN_STATE));
+            // After the outer guard is released, a fresh top-level call succeeds
+            // (the owner token was cleared).
+            assert_eq!(lock_client(c, |_| 7i32).ok(), Some(7));
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn fatal_disconnect_fires_disconnected_once_and_clears_connection() {
+        use std::sync::atomic::AtomicU32;
+        static DISCONNECTED_HITS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn count_disconnected(
+            _conn: *mut he_conn_t,
+            new_state: he_conn_state_t,
+            _ctx: *mut c_void,
+        ) -> he_return_code_t {
+            if new_state == he_conn_state_t::HE_STATE_DISCONNECTED {
+                DISCONNECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            he_return_code_t::HE_SUCCESS
+        }
+
+        unsafe {
+            DISCONNECTED_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+            let c = he_client_create();
+            he_ssl_ctx_set_state_change_cb(he_client_get_ssl_ctx(c), count_disconnected);
+
+            // Drive the teardown directly: producing a *real* fatal wire error
+            // needs a live handshake, but this exercises the same state-machine
+            // path (fire DISCONNECTED, set state, drop the live Connection).
+            let client = &mut *c;
+            fatal_disconnect(client);
+            assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_DISCONNECTED);
+            assert!(client.connection.is_none());
+
+            // Idempotent: a second call must not re-fire the transition.
+            fatal_disconnect(client);
+            assert_eq!(DISCONNECTED_HITS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
             he_client_destroy(c);
         }
     }

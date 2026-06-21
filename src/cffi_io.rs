@@ -53,6 +53,10 @@ impl CffiOutsideIO {
 
 impl OutsideIOSendCallback for CffiOutsideIO {
     fn send(&self, buf: &[u8]) -> IOCallbackResult<usize> {
+        // The C `outside_write_cb` typedef takes `uint8_t*` (matching the OSS
+        // API), but `buf` is borrowed read-only here. The callback MUST treat
+        // the buffer as read-only — writing through this pointer is undefined
+        // behaviour, as it aliases a shared `&[u8]`.
         // SAFETY: `conn_ptr` and `ctx` are valid for the lifetime of the C
         // connection, and `buf` is a valid slice for the duration of this call.
         let result = unsafe {

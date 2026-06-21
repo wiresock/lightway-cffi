@@ -71,6 +71,27 @@ jobs:
           git diff --exit-code include/lightway_cffi.h || \
             (echo "::error::include/lightway_cffi.h is out of date. Run 'cargo build' and commit the result." && exit 1)
 
+  header-compiles:
+    name: Header compiles as C/C++
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile the committed header on its own (no Rust toolchain needed) so a
+      # change that leaves it referencing an undefined type, etc., fails CI
+      # instead of only being caught in review.
+      - name: Compile committed header as C and C++
+        run: |
+          cat > /tmp/htest.c <<'EOF'
+          #define XV_LIGHTWAY_CFFI_NO_PACKET_FILTER_INCLUDE
+          #include "lightway_cffi.h"
+          int main(void) { return 0; }
+          EOF
+          cp /tmp/htest.c /tmp/htest.cpp
+          cc  -I include -Wall -Wextra -fsyntax-only /tmp/htest.c
+          c++ -I include -Wall -Wextra -fsyntax-only /tmp/htest.cpp
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
