@@ -1664,7 +1664,9 @@ mod tests {
     fn use_pqc_roundtrip() {
         unsafe {
             let c = he_client_create();
+            assert!(!c.is_null());
             let ssl = he_client_get_ssl_ctx(c);
+            assert!(!ssl.is_null());
             // Enabling PQC now succeeds and is recorded (it is honoured at
             // connect time via with_pq_crypto), as does disabling it.
             assert_eq!(he_ssl_ctx_set_use_pqc(ssl, true), he_return_code_t::HE_SUCCESS);
