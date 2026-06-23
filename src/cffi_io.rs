@@ -77,6 +77,19 @@ impl OutsideIOSendCallback for CffiOutsideIO {
         }
     }
 
+    /// GSO (UDP segmentation offload) is not driven by this shim: the C
+    /// consumer owns the socket and the data path forwards single packets via
+    /// `he_conn_inside_packet_received` / `Connection::inside_data_received`,
+    /// which never calls `send_gso`. Report it unsupported, matching
+    /// `lightway-core`'s own non-GSO `OutsideIOSendCallback` fakes.
+    fn send_gso(
+        &self,
+        _bufs: &[std::io::IoSlice<'_>],
+        _gso_size: u16,
+    ) -> IOCallbackResult<usize> {
+        IOCallbackResult::Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
     fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
