@@ -541,6 +541,16 @@ fn client_connect_locked(client: &mut he_client_t) -> he_return_code_t {
         conn_builder
     };
 
+    // Offer a post-quantum key-share group when PQC was requested via
+    // `he_ssl_ctx_set_use_pqc`. P521MLKEM1024 matches the reference
+    // `lightway-client` default and the server's preferred PQC group; when PQC
+    // is disabled the handshake stays on the classical groups.
+    let conn_builder = if client.ssl_ctx.use_pqc {
+        conn_builder.with_pq_crypto(lightway_core::KeyShare::P521MLKEM1024)
+    } else {
+        conn_builder
+    };
+
     // ── 7. connect() → live Connection  ────────────────────────────────────
     let app_state = CffiAppState {
         nudge_time_cb: client.ssl_ctx.nudge_time_cb,
@@ -943,13 +953,10 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
 
 /// Enable or disable post-quantum cryptography.
 ///
-/// The pinned `lightway-core` `ClientContextBuilder` exposes no API to select
-/// the client's TLS key-share groups, so this shim cannot actually enable PQC
-/// on a client connection.  Rather than silently accept the request and
-/// downgrade security without telling the caller, enabling PQC returns
-/// `HE_ERR_BAD_PARAM`; disabling it (the only behaviour we can honour) succeeds.
-/// If `lightway-core` later exposes a client PQC/group API, wire it in
-/// `client_connect_locked` and relax this check.
+/// When enabled, the client offers a post-quantum key-share group
+/// (P521MLKEM1024) during the TLS handshake; when disabled, the handshake uses
+/// the classical key-share groups. The group matches the reference Lightway
+/// client default and the server's preferred PQC group.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
@@ -961,13 +968,8 @@ pub unsafe extern "C" fn he_ssl_ctx_set_use_pqc(
     if ssl_ctx.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
-    if use_pqc {
-        // Unsupported on the client with the pinned core — fail loudly instead
-        // of pretending it took effect.
-        return he_return_code_t::HE_ERR_BAD_PARAM;
-    }
     // SAFETY: null check above; ssl_ctx is valid for this call.
-    unsafe { (*ssl_ctx).use_pqc = false };
+    unsafe { (*ssl_ctx).use_pqc = use_pqc };
     he_return_code_t::HE_SUCCESS
 }
 
@@ -1657,12 +1659,18 @@ mod tests {
     }
 
     #[test]
-    fn use_pqc_enable_is_rejected() {
+    fn use_pqc_roundtrip() {
         unsafe {
             let c = he_client_create();
+            assert!(!c.is_null());
             let ssl = he_client_get_ssl_ctx(c);
-            assert_eq!(he_ssl_ctx_set_use_pqc(ssl, true), he_return_code_t::HE_ERR_BAD_PARAM);
+            assert!(!ssl.is_null());
+            // Enabling PQC now succeeds and is recorded (it is honoured at
+            // connect time via with_pq_crypto), as does disabling it.
+            assert_eq!(he_ssl_ctx_set_use_pqc(ssl, true), he_return_code_t::HE_SUCCESS);
+            assert!((*ssl).use_pqc);
             assert_eq!(he_ssl_ctx_set_use_pqc(ssl, false), he_return_code_t::HE_SUCCESS);
+            assert!(!(*ssl).use_pqc);
             assert_eq!(
                 he_ssl_ctx_set_use_pqc(std::ptr::null_mut(), false),
                 he_return_code_t::HE_ERR_NULL_POINTER
