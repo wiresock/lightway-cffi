@@ -953,12 +953,10 @@ pub unsafe extern "C" fn he_ssl_ctx_set_server_dn(
 
 /// Enable or disable post-quantum cryptography.
 ///
-/// When enabled, the client offers a post-quantum key-share group during the
-/// TLS handshake via `lightway-core`'s `ClientConnectionBuilder::with_pq_crypto`
-/// (wired up in `client_connect_locked`). The group used is
-/// [`lightway_core::KeyShare::P521MLKEM1024`], matching the reference
-/// `lightway-client` default and the server's preferred PQC group. Disabling
-/// it leaves the handshake on the classical groups.
+/// When enabled, the client offers a post-quantum key-share group
+/// (P521MLKEM1024) during the TLS handshake; when disabled, the handshake uses
+/// the classical key-share groups. The group matches the reference Lightway
+/// client default and the server's preferred PQC group.
 ///
 /// # Safety
 /// `ssl_ctx` must be a valid non-null pointer.
