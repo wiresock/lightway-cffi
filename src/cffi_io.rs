@@ -87,7 +87,10 @@ impl OutsideIOSendCallback for CffiOutsideIO {
         _bufs: &[std::io::IoSlice<'_>],
         _gso_size: u16,
     ) -> IOCallbackResult<usize> {
-        IOCallbackResult::Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        IOCallbackResult::Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "send_gso not supported by lightway-cffi shim",
+        ))
     }
 
     fn peer_addr(&self) -> SocketAddr {
