@@ -758,13 +758,12 @@ he_return_code_t he_ssl_ctx_set_server_dn(he_ssl_ctx_t *ssl_ctx, const char *ser
 /*
  Enable or disable post-quantum cryptography.
 
- The pinned `lightway-core` `ClientContextBuilder` exposes no API to select
- the client's TLS key-share groups, so this shim cannot actually enable PQC
- on a client connection.  Rather than silently accept the request and
- downgrade security without telling the caller, enabling PQC returns
- `HE_ERR_BAD_PARAM`; disabling it (the only behaviour we can honour) succeeds.
- If `lightway-core` later exposes a client PQC/group API, wire it in
- `client_connect_locked` and relax this check.
+ When enabled, the client offers a post-quantum key-share group during the
+ TLS handshake via `lightway-core`'s `ClientConnectionBuilder::with_pq_crypto`
+ (wired up in `client_connect_locked`). The group used is
+ [`lightway_core::KeyShare::P521MLKEM1024`], matching the reference
+ `lightway-client` default and the server's preferred PQC group. Disabling
+ it leaves the handshake on the classical groups.
 
  # Safety
  `ssl_ctx` must be a valid non-null pointer.

@@ -13,6 +13,8 @@ changes to their existing `lightway_tunnel.h` call sites.
 - Full Lightway client connection lifecycle (`he_client_create`, `he_client_connect`, …)
 - ExpressLane fast-path support — key-material callback and state-change callback
 - ChaCha20 cipher selection
+- Post-quantum key exchange — `he_ssl_ctx_set_use_pqc(ctx, true)` offers a PQC
+  key-share group (`P521MLKEM1024`) during the TLS handshake
 - Thread-safe: concurrent `he_conn_outside_data_received` / `he_conn_inside_packet_received` /
   `he_conn_nudge` calls are serialised internally. Re-entrant calls into a locking API from
   within a C callback are rejected with `HE_ERR_INVALID_CONN_STATE` rather than dead-locking.
@@ -38,9 +40,10 @@ What is and isn't serialised is deliberately narrow:
 
 ## Limitations
 
-- **Post-quantum crypto:** the pinned `lightway-core` `ClientContextBuilder` exposes no
-  client-side key-share/group API, so `he_ssl_ctx_set_use_pqc(ctx, true)` returns
-  `HE_ERR_BAD_PARAM` rather than silently connecting without PQC. Passing `false` succeeds.
+- **Post-quantum crypto:** enabling PQC selects a single key-share group
+  (`P521MLKEM1024`, the reference `lightway-client` default and the server's
+  preferred group); the C API does not yet expose per-connection group
+  selection.
 - **PMTUD:** Path MTU Discovery is not driven by this shim. The PMTUD callback setters and
   `he_conn_get_effective_pmtu` are retained for ABI compatibility but the callbacks never fire
   and the effective PMTU is always reported as `0`.
@@ -108,11 +111,13 @@ commit the updated header.
 `lightway-core` is pulled directly from the public GitHub repository:
 
 ```toml
-lightway-core = { git = "https://github.com/expressvpn/lightway", rev = "..." }
+lightway-core = { git = "https://github.com/expressvpn/lightway", rev = "...", features = ["postquantum"] }
 ```
 
-No private code is required. ExpressLane is fully supported in the open-source
-`lightway-core` crate.
+No private code is required. ExpressLane and post-quantum key exchange are both
+fully supported in the open-source `lightway-core` crate. The `postquantum`
+feature gates `lightway-core`'s `with_pq_crypto` API; wolfSSL itself is always
+compiled with ML-KEM support (a default `wolfssl-sys` feature).
 
 ## API compatibility notes
 
