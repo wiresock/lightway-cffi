@@ -20,6 +20,48 @@
 #include <stdbool.h>
 
 /*
+ Return codes used by all `he_expresslane_*` functions.
+ */
+typedef enum {
+    /*
+     Operation succeeded.
+     */
+    HE_EXPRESSLANE_SUCCESS = 0,
+    /*
+     A null pointer was supplied where one is not permitted.
+     */
+    HE_EXPRESSLANE_ERR_NULL_POINTER = -1,
+    /*
+     Caller-provided output buffer is too small.
+     */
+    HE_EXPRESSLANE_ERR_BUFFER_TOO_SMALL = -2,
+    /*
+     Wire packet is shorter than the minimum ExpressLane header.
+     */
+    HE_EXPRESSLANE_ERR_INSUFFICIENT_DATA = -3,
+    /*
+     AEAD authentication failed, or the packet is otherwise malformed.
+     */
+    HE_EXPRESSLANE_ERR_INVALID_DATA = -4,
+    /*
+     Wire counter was rejected by the replay window.
+     */
+    HE_EXPRESSLANE_ERR_REPLAYED = -5,
+    /*
+     No key is installed for this operation.
+     */
+    HE_EXPRESSLANE_ERR_KEY_NOT_SET = -6,
+    /*
+     Key material could not be loaded into the cipher.
+     */
+    HE_EXPRESSLANE_ERR_INVALID_KEY = -7,
+    /*
+     A panic was caught at the FFI boundary.
+     */
+    HE_EXPRESSLANE_ERR_PANIC = -8,
+} he_expresslane_return_code_t;
+
+/*
  ExpressLane wire-format version, matching `lightway_expresslane::ExpresslaneVersion`.
 
  `he_expresslane_session_create` takes a raw `uint8_t` rather than this
@@ -85,6 +127,75 @@ he_expresslane_session_t *he_expresslane_session_create(uint8_t version);
  destruction.
  */
 void he_expresslane_session_destroy(he_expresslane_session_t *session);
+
+/*
+ Reserve a wire counter value guaranteed unique for this session. Safe to
+ call concurrently from multiple threads on the same session. Returns 0
+ if `session` is null (0 is never a value `reserve_counter` itself would
+ return, since it starts at 1).
+
+ # Safety
+ `session` must be a valid non-null pointer or null.
+ */
+uint64_t he_expresslane_reserve_counter(const he_expresslane_session_t *session);
+
+/*
+ Stage a new "next self" key. Call `he_expresslane_promote_self_key` once
+ the peer has acknowledged the rotation to make it the active send key.
+ Safe to call concurrently with `he_expresslane_encrypt` on the same
+ session.
+
+ # Safety
+ `session` must be a valid non-null pointer. `key` must point to 32
+ readable bytes.
+ */
+he_expresslane_return_code_t he_expresslane_set_next_self_key(const he_expresslane_session_t *session,
+                                                              const uint8_t *key);
+
+/*
+ Promote the staged "next self" key to the active send key. A no-op if
+ no key is staged. Safe to call concurrently with `he_expresslane_encrypt`
+ on the same session.
+
+ # Safety
+ `session` must be a valid non-null pointer or null.
+ */
+void he_expresslane_promote_self_key(const he_expresslane_session_t *session);
+
+/*
+ Total number of packets successfully encrypted so far on this session.
+
+ # Safety
+ `session` must be a valid non-null pointer or null.
+ */
+uint64_t he_expresslane_packets_sent(const he_expresslane_session_t *session);
+
+/*
+ Encrypt `plain_text` into ExpressLane wire format. Safe to call
+ concurrently from multiple threads on the same session, provided each
+ call uses a unique `counter` (see `he_expresslane_reserve_counter`).
+
+ `out` must have capacity for at least
+ `he_expresslane_wire_overhead() + plain_text_len` bytes. On success,
+ `*out_len` is set to the number of bytes written to `out`.
+
+ # Safety
+ `session` must be a valid non-null pointer. `session_id` must point to 8
+ readable bytes. `plain_text` must point to `plain_text_len` readable
+ bytes. `iv` must point to 12 readable bytes. `out` must point to
+ `out_capacity` writable bytes. `out_len` must be a valid pointer to a
+ `size_t`.
+ */
+he_expresslane_return_code_t he_expresslane_encrypt(const he_expresslane_session_t *session,
+                                                    uint64_t counter,
+                                                    const uint8_t *session_id,
+                                                    const uint8_t *plain_text,
+                                                    uintptr_t plain_text_len,
+                                                    const uint8_t *iv,
+                                                    bool is_encoded,
+                                                    uint8_t *out,
+                                                    uintptr_t out_capacity,
+                                                    uintptr_t *out_len);
 
 #ifdef __cplusplus
 }  // extern "C"
