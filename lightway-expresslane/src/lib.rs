@@ -7,5 +7,7 @@
 //! in this repo for the full design.
 
 mod key;
+mod version;
 
 pub use key::{EXPRESSLANE_KEY_SIZE, ExpresslaneKey};
+pub use version::ExpresslaneVersion;
