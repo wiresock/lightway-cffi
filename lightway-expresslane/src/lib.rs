@@ -5,3 +5,7 @@
 //! `lightway-core`, using the pure-Rust `aes-gcm` crate instead of
 //! wolfssl. See `docs/superpowers/specs/2026-07-16-expresslane-data-cffi-design.md`
 //! in this repo for the full design.
+
+mod key;
+
+pub use key::{EXPRESSLANE_KEY_SIZE, ExpresslaneKey};
