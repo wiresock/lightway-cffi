@@ -9,6 +9,7 @@
 mod cipher;
 mod error;
 mod key;
+mod replay_window;
 mod version;
 
 pub use error::{ExpresslaneError, ExpresslaneResult};
