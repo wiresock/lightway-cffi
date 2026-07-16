@@ -6,6 +6,9 @@ description = "C ABI shim over lightway-core (Rust) for C/C++ consumers (e.g. kp
 license = "AGPL-3.0-only"
 repository = "https://github.com/expressvpn/lightway-cffi"
 
+[workspace]
+members = ["lightway-expresslane", "lightway-expresslane-cffi"]
+
 [lib]
 # cdylib: lightway_cffi.dll + import lib for dynamic linking
 # staticlib: lightway_cffi.lib for fully-static embedding
