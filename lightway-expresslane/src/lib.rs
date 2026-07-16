@@ -6,8 +6,11 @@
 //! wolfssl. See `docs/superpowers/specs/2026-07-16-expresslane-data-cffi-design.md`
 //! in this repo for the full design.
 
+mod cipher;
+mod error;
 mod key;
 mod version;
 
+pub use error::{ExpresslaneError, ExpresslaneResult};
 pub use key::{EXPRESSLANE_KEY_SIZE, ExpresslaneKey};
 pub use version::ExpresslaneVersion;
