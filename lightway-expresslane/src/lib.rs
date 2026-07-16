@@ -10,8 +10,10 @@ mod cipher;
 mod error;
 mod key;
 mod replay_window;
+mod session;
 mod version;
 
 pub use error::{ExpresslaneError, ExpresslaneResult};
 pub use key::{EXPRESSLANE_KEY_SIZE, ExpresslaneKey};
+pub use session::ExpresslaneSession;
 pub use version::ExpresslaneVersion;
