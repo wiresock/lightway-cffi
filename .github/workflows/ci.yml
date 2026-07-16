@@ -66,10 +66,10 @@ jobs:
       - name: Build (regenerates include/lightway_cffi.h)
         run: cargo build
 
-      - name: Verify header is unchanged
+      - name: Verify headers are unchanged
         run: |
-          git diff --exit-code include/lightway_cffi.h || \
-            (echo "::error::include/lightway_cffi.h is out of date. Run 'cargo build' and commit the result." && exit 1)
+          git diff --exit-code include/lightway_cffi.h lightway-expresslane-cffi/include/lightway_expresslane_cffi.h || \
+            (echo "::error::a generated header is out of date. Run 'cargo build' and commit the result." && exit 1)
 
   header-compiles:
     name: Header compiles as C/C++
@@ -91,6 +91,16 @@ jobs:
           cp /tmp/htest.c /tmp/htest.cpp
           cc  -I include -Wall -Wextra -fsyntax-only /tmp/htest.c
           c++ -I include -Wall -Wextra -fsyntax-only /tmp/htest.cpp
+
+      - name: Compile committed ExpressLane header as C and C++
+        run: |
+          cat > /tmp/htest_expresslane.c <<'EOF'
+          #include "lightway_expresslane_cffi.h"
+          int main(void) { return 0; }
+          EOF
+          cp /tmp/htest_expresslane.c /tmp/htest_expresslane.cpp
+          cc  -I lightway-expresslane-cffi/include -Wall -Wextra -fsyntax-only /tmp/htest_expresslane.c
+          c++ -I lightway-expresslane-cffi/include -Wall -Wextra -fsyntax-only /tmp/htest_expresslane.cpp
 
   clippy:
     name: Clippy
