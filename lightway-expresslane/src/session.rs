@@ -560,4 +560,109 @@ mod tests {
         session.update_peer_key(ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE])).unwrap();
         assert!(session.has_valid_keys());
     }
+
+    #[test]
+    fn concurrent_encrypt_from_multiple_threads_produces_unique_counters_and_decrypts() {
+        let key = ExpresslaneKey([7u8; EXPRESSLANE_KEY_SIZE]);
+        let tx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        tx.update_next_self_key(key).unwrap();
+        tx.promote_self_key();
+
+        let session_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+
+        let packets: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let tx = &tx;
+                    scope.spawn(move || {
+                        let mut produced = Vec::with_capacity(PER_THREAD);
+                        for i in 0..PER_THREAD {
+                            let counter = tx.reserve_counter();
+                            let plain_text = format!("thread {t} packet {i}");
+                            let mut buf =
+                                vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+                            let iv = [t as u8; 12];
+                            let n = tx
+                                .encrypt(counter, session_id, plain_text.as_bytes(), iv, false, &mut buf)
+                                .unwrap();
+                            buf.truncate(n);
+                            produced.push(buf);
+                        }
+                        produced
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(packets.len(), THREADS * PER_THREAD);
+
+        let mut counters: Vec<u64> = packets
+            .iter()
+            .map(|p| u64::from_be_bytes(p[0..8].try_into().unwrap()))
+            .collect();
+        counters.sort_unstable();
+        counters.dedup();
+        assert_eq!(counters.len(), THREADS * PER_THREAD, "counters must all be unique");
+
+        let mut rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        rx.update_peer_key(key).unwrap();
+        for packet in &packets {
+            let mut out = vec![0u8; packet.len() - ExpresslaneSession::WIRE_OVERHEAD];
+            let (n, _) = rx.decrypt(session_id, packet, &mut out).unwrap();
+            assert_eq!(n, out.len());
+        }
+        assert_eq!(rx.packets_received(), (THREADS * PER_THREAD) as u64);
+    }
+
+    #[test]
+    fn promote_self_key_mid_stream_does_not_corrupt_in_flight_encrypt() {
+        let key_a = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
+        let key_b = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
+        let tx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        tx.update_next_self_key(key_a).unwrap();
+        tx.promote_self_key();
+        tx.update_next_self_key(key_b).unwrap();
+
+        let session_id = [9u8; 8];
+        let plain_text = b"rotate me";
+
+        let packets = std::thread::scope(|scope| {
+            let encryptor = {
+                let tx = &tx;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    for _ in 0..200 {
+                        let counter = tx.reserve_counter();
+                        let mut buf = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+                        if let Ok(n) =
+                            tx.encrypt(counter, session_id, plain_text, [0u8; 12], false, &mut buf)
+                        {
+                            buf.truncate(n);
+                            results.push(buf);
+                        }
+                    }
+                    results
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            tx.promote_self_key();
+            encryptor.join().unwrap()
+        });
+
+        assert!(!packets.is_empty());
+
+        // Every produced packet must decrypt with one of the two known
+        // keys - none corrupted by the concurrent rotation.
+        let mut rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        rx.update_peer_key(key_a).unwrap();
+        rx.update_peer_key(key_b).unwrap(); // key_b current, key_a prev - both tried
+        for packet in &packets {
+            let mut out = vec![0u8; packet.len() - ExpresslaneSession::WIRE_OVERHEAD];
+            rx.decrypt(session_id, packet, &mut out)
+                .unwrap_or_else(|e| panic!("packet failed to decrypt: {e}"));
+        }
+    }
 }
