@@ -220,6 +220,142 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
     })
 }
 
+/// Install a new peer (receive) key. The previous peer key becomes the
+/// fallback used by `he_expresslane_decrypt` for packets still in flight
+/// from before the peer's rotation. Caller must externally serialize this
+/// call against `he_expresslane_decrypt`/`he_expresslane_has_valid_keys`/
+/// `he_expresslane_packets_received` on the same session.
+///
+/// # Safety
+/// `session` must be a valid non-null pointer. `key` must point to 32
+/// readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_expresslane_set_peer_key(
+    session: *mut he_expresslane_session_t,
+    key: *const u8,
+) -> he_expresslane_return_code_t {
+    if session.is_null() || key.is_null() {
+        return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
+    }
+    ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
+        // SAFETY: null checks above; key points to EXPRESSLANE_KEY_SIZE
+        // readable bytes per the function's documented contract.
+        let key_bytes: [u8; EXPRESSLANE_KEY_SIZE] =
+            unsafe { std::slice::from_raw_parts(key, EXPRESSLANE_KEY_SIZE) }
+                .try_into()
+                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
+        // SAFETY: null check above; session is valid for this call.
+        match unsafe { &mut *session }
+            .0
+            .update_peer_key(ExpresslaneKey::from(key_bytes))
+        {
+            Ok(()) => he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS,
+            Err(e) => e.into(),
+        }
+    })
+}
+
+/// True if both a self (send) key and a peer (receive) key are installed.
+/// Caller must externally serialize this call against
+/// `he_expresslane_decrypt`/`he_expresslane_set_peer_key` on the same
+/// session.
+///
+/// # Safety
+/// `session` must be a valid non-null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_expresslane_has_valid_keys(
+    session: *mut he_expresslane_session_t,
+) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: null check above; session is valid for this call.
+    unsafe { &mut *session }.0.has_valid_keys()
+}
+
+/// Total number of packets successfully decrypted so far on this session.
+/// Caller must externally serialize this call against
+/// `he_expresslane_decrypt` on the same session.
+///
+/// # Safety
+/// `session` must be a valid non-null pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_expresslane_packets_received(
+    session: *mut he_expresslane_session_t,
+) -> u64 {
+    if session.is_null() {
+        return 0;
+    }
+    // SAFETY: null check above; session is valid for this call.
+    unsafe { &mut *session }.0.packets_received()
+}
+
+/// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out` must
+/// have capacity for at least `wire_packet_len - he_expresslane_wire_overhead()`
+/// bytes. On success, `*out_len` is set to the plaintext length and
+/// `*is_encoded` to the packet's encoded flag. Caller must externally
+/// serialize this call against `he_expresslane_set_peer_key`/
+/// `he_expresslane_has_valid_keys`/`he_expresslane_packets_received` on the
+/// same session — no internal locking.
+///
+/// # Safety
+/// `session` must be a valid non-null pointer. `session_id` must point to 8
+/// readable bytes. `wire_packet` must point to `wire_packet_len` readable
+/// bytes. `out` must point to `out_capacity` writable bytes. `out_len` and
+/// `is_encoded` must be valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_expresslane_decrypt(
+    session: *mut he_expresslane_session_t,
+    session_id: *const u8,
+    wire_packet: *const u8,
+    wire_packet_len: usize,
+    out: *mut u8,
+    out_capacity: usize,
+    out_len: *mut usize,
+    is_encoded: *mut bool,
+) -> he_expresslane_return_code_t {
+    if session.is_null()
+        || session_id.is_null()
+        || wire_packet.is_null()
+        || out.is_null()
+        || out_len.is_null()
+        || is_encoded.is_null()
+    {
+        return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
+    }
+    ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
+        // SAFETY: null checks above; each pointer is valid for the length
+        // documented in this function's `# Safety` section.
+        let session_id_bytes: [u8; 8] =
+            unsafe { std::slice::from_raw_parts(session_id, 8) }.try_into().unwrap();
+        let wire_slice = unsafe { std::slice::from_raw_parts(wire_packet, wire_packet_len) };
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_capacity) };
+
+        // SAFETY: null check above; session is valid for this call.
+        let result = unsafe { &mut *session }.0.decrypt(session_id_bytes, wire_slice, out_slice);
+        match result {
+            Ok((len, encoded)) => {
+                // SAFETY: null checks above; out_len/is_encoded are valid
+                // writable pointers per the function's documented contract.
+                unsafe {
+                    *out_len = len;
+                    *is_encoded = encoded;
+                }
+                he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS
+            }
+            Err(e) => e.into(),
+        }
+    })
+}
+
+/// Wire overhead in bytes (40): counter(8) + iv(12) + tag(16) + data_len(2)
+/// + flags(2). Use this to size buffers for `he_expresslane_encrypt` /
+/// `he_expresslane_decrypt` without hardcoding the constant.
+#[unsafe(no_mangle)]
+pub extern "C" fn he_expresslane_wire_overhead() -> usize {
+    ExpresslaneSession::WIRE_OVERHEAD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +501,138 @@ mod tests {
         };
         assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_BUFFER_TOO_SMALL);
         unsafe { he_expresslane_session_destroy(session) };
+    }
+
+    #[test]
+    fn wire_overhead_is_40() {
+        assert_eq!(he_expresslane_wire_overhead(), 40);
+    }
+
+    #[test]
+    fn has_valid_keys_false_until_both_keys_set() {
+        let session = unsafe { he_expresslane_session_create(2) };
+        assert!(!unsafe { he_expresslane_has_valid_keys(session) });
+
+        let key = [1u8; 32];
+        unsafe { he_expresslane_set_next_self_key(session, key.as_ptr()) };
+        unsafe { he_expresslane_promote_self_key(session) };
+        assert!(!unsafe { he_expresslane_has_valid_keys(session) }); // peer still missing
+
+        assert_eq!(
+            unsafe { he_expresslane_set_peer_key(session, key.as_ptr()) },
+            he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS
+        );
+        assert!(unsafe { he_expresslane_has_valid_keys(session) });
+
+        unsafe { he_expresslane_session_destroy(session) };
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips_through_the_c_api() {
+        let sender = unsafe { he_expresslane_session_create(2) };
+        let receiver = unsafe { he_expresslane_session_create(2) };
+        let key = [42u8; 32];
+
+        unsafe { he_expresslane_set_next_self_key(sender, key.as_ptr()) };
+        unsafe { he_expresslane_promote_self_key(sender) };
+        unsafe { he_expresslane_set_peer_key(receiver, key.as_ptr()) };
+
+        let session_id = [1u8; 8];
+        let plain_text = b"Hello, ExpressLane!";
+        let iv = [9u8; 12];
+        let overhead = he_expresslane_wire_overhead();
+
+        let mut wire = vec![0u8; overhead + plain_text.len()];
+        let mut wire_len: usize = 0;
+        let counter = unsafe { he_expresslane_reserve_counter(sender) };
+        let rc = unsafe {
+            he_expresslane_encrypt(
+                sender,
+                counter,
+                session_id.as_ptr(),
+                plain_text.as_ptr(),
+                plain_text.len(),
+                iv.as_ptr(),
+                false,
+                wire.as_mut_ptr(),
+                wire.len(),
+                &mut wire_len,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS);
+
+        let mut out = vec![0u8; plain_text.len()];
+        let mut out_len: usize = 0;
+        let mut is_encoded = true; // must be overwritten to false
+        let rc = unsafe {
+            he_expresslane_decrypt(
+                receiver,
+                session_id.as_ptr(),
+                wire.as_ptr(),
+                wire_len,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut out_len,
+                &mut is_encoded,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS);
+        assert_eq!(out_len, plain_text.len());
+        assert!(!is_encoded);
+        assert_eq!(&out[..out_len], plain_text);
+        assert_eq!(unsafe { he_expresslane_packets_received(receiver) }, 1);
+
+        unsafe { he_expresslane_session_destroy(sender) };
+        unsafe { he_expresslane_session_destroy(receiver) };
+    }
+
+    #[test]
+    fn decrypt_without_key_returns_key_not_set() {
+        let receiver = unsafe { he_expresslane_session_create(2) };
+        let session_id = [1u8; 8];
+        let wire = vec![0u8; he_expresslane_wire_overhead()];
+        let mut out = vec![0u8; 4];
+        let mut out_len: usize = 0;
+        let mut is_encoded = false;
+
+        let rc = unsafe {
+            he_expresslane_decrypt(
+                receiver,
+                session_id.as_ptr(),
+                wire.as_ptr(),
+                wire.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut out_len,
+                &mut is_encoded,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_KEY_NOT_SET);
+        unsafe { he_expresslane_session_destroy(receiver) };
+    }
+
+    #[test]
+    fn decrypt_null_pointers_return_null_pointer_error() {
+        let receiver = unsafe { he_expresslane_session_create(2) };
+        let session_id = [1u8; 8];
+        let wire = vec![0u8; he_expresslane_wire_overhead()];
+        let mut out = vec![0u8; 4];
+        let mut out_len: usize = 0;
+        let mut is_encoded = false;
+
+        let rc = unsafe {
+            he_expresslane_decrypt(
+                std::ptr::null_mut(),
+                session_id.as_ptr(),
+                wire.as_ptr(),
+                wire.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut out_len,
+                &mut is_encoded,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER);
+        unsafe { he_expresslane_session_destroy(receiver) };
     }
 }

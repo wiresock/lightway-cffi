@@ -197,6 +197,72 @@ he_expresslane_return_code_t he_expresslane_encrypt(const he_expresslane_session
                                                     uintptr_t out_capacity,
                                                     uintptr_t *out_len);
 
+/*
+ Install a new peer (receive) key. The previous peer key becomes the
+ fallback used by `he_expresslane_decrypt` for packets still in flight
+ from before the peer's rotation. Caller must externally serialize this
+ call against `he_expresslane_decrypt`/`he_expresslane_has_valid_keys`/
+ `he_expresslane_packets_received` on the same session.
+
+ # Safety
+ `session` must be a valid non-null pointer. `key` must point to 32
+ readable bytes.
+ */
+he_expresslane_return_code_t he_expresslane_set_peer_key(he_expresslane_session_t *session,
+                                                         const uint8_t *key);
+
+/*
+ True if both a self (send) key and a peer (receive) key are installed.
+ Caller must externally serialize this call against
+ `he_expresslane_decrypt`/`he_expresslane_set_peer_key` on the same
+ session.
+
+ # Safety
+ `session` must be a valid non-null pointer.
+ */
+bool he_expresslane_has_valid_keys(he_expresslane_session_t *session);
+
+/*
+ Total number of packets successfully decrypted so far on this session.
+ Caller must externally serialize this call against
+ `he_expresslane_decrypt` on the same session.
+
+ # Safety
+ `session` must be a valid non-null pointer or null.
+ */
+uint64_t he_expresslane_packets_received(he_expresslane_session_t *session);
+
+/*
+ Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out` must
+ have capacity for at least `wire_packet_len - he_expresslane_wire_overhead()`
+ bytes. On success, `*out_len` is set to the plaintext length and
+ `*is_encoded` to the packet's encoded flag. Caller must externally
+ serialize this call against `he_expresslane_set_peer_key`/
+ `he_expresslane_has_valid_keys`/`he_expresslane_packets_received` on the
+ same session — no internal locking.
+
+ # Safety
+ `session` must be a valid non-null pointer. `session_id` must point to 8
+ readable bytes. `wire_packet` must point to `wire_packet_len` readable
+ bytes. `out` must point to `out_capacity` writable bytes. `out_len` and
+ `is_encoded` must be valid pointers.
+ */
+he_expresslane_return_code_t he_expresslane_decrypt(he_expresslane_session_t *session,
+                                                    const uint8_t *session_id,
+                                                    const uint8_t *wire_packet,
+                                                    uintptr_t wire_packet_len,
+                                                    uint8_t *out,
+                                                    uintptr_t out_capacity,
+                                                    uintptr_t *out_len,
+                                                    bool *is_encoded);
+
+/*
+ Wire overhead in bytes (40): counter(8) + iv(12) + tag(16) + data_len(2)
+ + flags(2). Use this to size buffers for `he_expresslane_encrypt` /
+ `he_expresslane_decrypt` without hardcoding the constant.
+ */
+uintptr_t he_expresslane_wire_overhead(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
