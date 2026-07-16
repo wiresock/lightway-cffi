@@ -258,7 +258,9 @@ he_expresslane_return_code_t he_expresslane_decrypt(he_expresslane_session_t *se
 
 /*
  Wire overhead in bytes (40): counter(8) + iv(12) + tag(16) + data_len(2)
- + flags(2). Use this to size buffers for `he_expresslane_encrypt` /
+ + flags(2).
+
+ Use this to size buffers for `he_expresslane_encrypt` /
  `he_expresslane_decrypt` without hardcoding the constant.
  */
 uintptr_t he_expresslane_wire_overhead(void);

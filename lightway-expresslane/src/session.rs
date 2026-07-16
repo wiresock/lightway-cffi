@@ -159,7 +159,7 @@ impl ExpresslaneSession {
     /// the peer's rotation.
     pub fn update_peer_key(&mut self, key: ExpresslaneKey) -> ExpresslaneResult<()> {
         let cipher = Cipher::new(&key)?;
-        self.prev_peer = std::mem::replace(&mut self.current_peer, Some(cipher));
+        self.prev_peer = self.current_peer.replace(cipher);
         Ok(())
     }
 

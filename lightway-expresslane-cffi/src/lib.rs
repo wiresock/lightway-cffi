@@ -14,7 +14,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 pub mod types;
 
 use lightway_expresslane::{ExpresslaneSession, ExpresslaneVersion};
-use types::he_expresslane_version_t;
 
 pub use types::he_expresslane_return_code_t;
 
@@ -191,12 +190,18 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
         return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
     }
     ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
-        // SAFETY: null checks above; each pointer is valid for the length
-        // documented in this function's `# Safety` section.
+        // SAFETY: null checks above; session_id is valid for 8 bytes per
+        // this function's documented contract.
         let session_id_bytes: [u8; 8] =
             unsafe { std::slice::from_raw_parts(session_id, 8) }.try_into().unwrap();
+        // SAFETY: null checks above; plain_text is valid for plain_text_len
+        // bytes per this function's documented contract.
         let plain_text_slice = unsafe { std::slice::from_raw_parts(plain_text, plain_text_len) };
+        // SAFETY: null checks above; iv is valid for 12 bytes per this
+        // function's documented contract.
         let iv_bytes: [u8; 12] = unsafe { std::slice::from_raw_parts(iv, 12) }.try_into().unwrap();
+        // SAFETY: null checks above; out is valid and writable for
+        // out_capacity bytes per this function's documented contract.
         let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_capacity) };
 
         // SAFETY: null check above; session is valid for this call.
@@ -324,11 +329,15 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
         return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
     }
     ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
-        // SAFETY: null checks above; each pointer is valid for the length
-        // documented in this function's `# Safety` section.
+        // SAFETY: null checks above; session_id is valid for 8 bytes per
+        // this function's documented contract.
         let session_id_bytes: [u8; 8] =
             unsafe { std::slice::from_raw_parts(session_id, 8) }.try_into().unwrap();
+        // SAFETY: null checks above; wire_packet is valid for
+        // wire_packet_len bytes per this function's documented contract.
         let wire_slice = unsafe { std::slice::from_raw_parts(wire_packet, wire_packet_len) };
+        // SAFETY: null checks above; out is valid and writable for
+        // out_capacity bytes per this function's documented contract.
         let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_capacity) };
 
         // SAFETY: null check above; session is valid for this call.
@@ -349,7 +358,9 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
 }
 
 /// Wire overhead in bytes (40): counter(8) + iv(12) + tag(16) + data_len(2)
-/// + flags(2). Use this to size buffers for `he_expresslane_encrypt` /
+/// + flags(2).
+///
+/// Use this to size buffers for `he_expresslane_encrypt` /
 /// `he_expresslane_decrypt` without hardcoding the constant.
 #[unsafe(no_mangle)]
 pub extern "C" fn he_expresslane_wire_overhead() -> usize {
