@@ -150,6 +150,86 @@ impl ExpresslaneSession {
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         Ok(needed)
     }
+
+    // ---- RX domain: caller must externally serialize all calls in this
+    // group against the same session handle. ----
+
+    /// Install a new peer (receive) key. The previous peer key becomes the
+    /// fallback used by `decrypt` for packets still in flight from before
+    /// the peer's rotation.
+    pub fn update_peer_key(&mut self, key: ExpresslaneKey) -> ExpresslaneResult<()> {
+        let cipher = Cipher::new(&key)?;
+        self.prev_peer = std::mem::replace(&mut self.current_peer, Some(cipher));
+        Ok(())
+    }
+
+    /// True if both a self (send) key and a peer (receive) key are
+    /// installed.
+    pub fn has_valid_keys(&mut self) -> bool {
+        self.current_peer.is_some()
+            && self
+                .current_self
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+    }
+
+    /// Total number of packets successfully decrypted so far.
+    pub fn packets_received(&mut self) -> u64 {
+        self.replay_window.packets_received()
+    }
+
+    /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out`
+    /// must have capacity for at least `wire_packet.len() - WIRE_OVERHEAD`
+    /// bytes. Returns `(plaintext_len, is_encoded)`.
+    pub fn decrypt(
+        &mut self,
+        session_id: [u8; 8],
+        wire_packet: &[u8],
+        out: &mut [u8],
+    ) -> ExpresslaneResult<(usize, bool)> {
+        if wire_packet.len() < Self::WIRE_OVERHEAD {
+            return Err(ExpresslaneError::InsufficientData);
+        }
+
+        let counter = u64::from_be_bytes(wire_packet[0..8].try_into().unwrap());
+
+        if self.replay_window.would_reject(counter) {
+            return Err(ExpresslaneError::Replayed);
+        }
+
+        let iv: [u8; 12] = wire_packet[8..20].try_into().unwrap();
+        let tag: [u8; 16] = wire_packet[20..36].try_into().unwrap();
+        let data_len = u16::from_be_bytes(wire_packet[36..38].try_into().unwrap()) as usize;
+        let flags = u16::from_be_bytes(wire_packet[38..40].try_into().unwrap());
+        let is_encoded = flags & 0x8000 != 0;
+
+        if wire_packet.len() < Self::WIRE_OVERHEAD + data_len {
+            return Err(ExpresslaneError::InsufficientData);
+        }
+        if out.len() < data_len {
+            return Err(ExpresslaneError::BufferTooSmall);
+        }
+
+        let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, is_encoded);
+        out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
+
+        let current = self.current_peer.as_ref().ok_or(ExpresslaneError::KeyNotSet)?;
+        if current.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag).is_err() {
+            match self.prev_peer.as_ref() {
+                Some(prev) => {
+                    prev.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)?;
+                }
+                None => return Err(ExpresslaneError::InvalidData),
+            }
+        }
+
+        if !self.replay_window.commit(counter) {
+            return Err(ExpresslaneError::Replayed);
+        }
+
+        Ok((data_len, is_encoded))
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +347,217 @@ mod tests {
         let mut out = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + 4];
         session.encrypt(1000, [1u8; 8], b"test", [0u8; 12], false, &mut out).unwrap();
         assert_eq!(u64::from_be_bytes(out[0..8].try_into().unwrap()), 1000);
+    }
+
+    #[test]
+    fn round_trip_encryption_decryption() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let plain_text = b"Hello, ExpressLane!";
+        let iv = [9u8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, iv, false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        let mut out = vec![0u8; plain_text.len()];
+        let (len, is_encoded) = receiver.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], plain_text);
+        assert!(!is_encoded);
+    }
+
+    #[test]
+    fn round_trip_with_encoded_flag() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"Encoded payload";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], true, &mut wire).unwrap();
+        wire.truncate(n);
+
+        let mut out = vec![0u8; plain_text.len()];
+        let (len, is_encoded) = receiver.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], plain_text);
+        assert!(is_encoded);
+    }
+
+    #[test]
+    fn decrypt_without_key_returns_key_not_set() {
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD];
+        let mut out = vec![0u8; 4];
+        let result = receiver.decrypt([1u8; 8], &wire, &mut out);
+        assert_eq!(result, Err(ExpresslaneError::KeyNotSet));
+    }
+
+    #[test]
+    fn decrypt_rejects_insufficient_data() {
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD - 1];
+        let mut out = vec![0u8; 4];
+        let result = receiver.decrypt([1u8; 8], &wire, &mut out);
+        assert_eq!(result, Err(ExpresslaneError::InsufficientData));
+    }
+
+    #[test]
+    fn decrypt_rejects_replay() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"replay me";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        let mut out = vec![0u8; plain_text.len()];
+        receiver.decrypt(session_id, &wire, &mut out).unwrap();
+        let result = receiver.decrypt(session_id, &wire, &mut out);
+        assert_eq!(result, Err(ExpresslaneError::Replayed));
+    }
+
+    #[test]
+    fn decrypt_falls_back_to_prev_peer_key_during_rotation() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let old_key = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
+        let new_key = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(old_key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(old_key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"in flight during rotation";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        // Receiver rotates to new_key before this in-flight (old_key-encrypted)
+        // packet arrives - it must still decrypt via prev_peer.
+        receiver.update_peer_key(new_key).unwrap();
+
+        let mut out = vec![0u8; plain_text.len()];
+        let (len, _) = receiver.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], plain_text);
+    }
+
+    #[test]
+    fn cross_version_v1_to_v2_fails() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version1);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"v1 to v2";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        let mut out = vec![0u8; plain_text.len()];
+        let result = receiver.decrypt(session_id, &wire, &mut out);
+        assert_eq!(result, Err(ExpresslaneError::InvalidData));
+    }
+
+    #[test]
+    fn tampered_flags_rejected_by_aead() {
+        // On-path attacker flips the encoded flag. AEAD must reject V2
+        // packets because the flags field is bound into the auth tag.
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"sensitive payload";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        assert_eq!(wire[38] & 0x80, 0, "precondition: encoded flag is clear");
+        wire[38] |= 0x80;
+
+        let mut out = vec![0u8; plain_text.len()];
+        let result = receiver.decrypt(session_id, &wire, &mut out);
+        assert_eq!(result, Err(ExpresslaneError::InvalidData));
+    }
+
+    #[test]
+    fn forged_packet_does_not_poison_replay_window() {
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"hello expresslane";
+
+        let mut wire1 = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire1).unwrap();
+        wire1.truncate(n);
+        let mut out = vec![0u8; plain_text.len()];
+        receiver.decrypt(session_id, &wire1, &mut out).unwrap();
+        assert_eq!(receiver.packets_received(), 1);
+
+        // Forge a packet with a huge counter and a bogus tag (no key).
+        let mut forged = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        forged[0..8].copy_from_slice(&(u64::MAX - 1).to_be_bytes());
+        forged[36..38].copy_from_slice(&(plain_text.len() as u16).to_be_bytes());
+        let mut out2 = vec![0u8; plain_text.len()];
+        let result = receiver.decrypt(session_id, &forged, &mut out2);
+        assert_eq!(result, Err(ExpresslaneError::InvalidData));
+
+        // Window state must be untouched by the forgery.
+        assert_eq!(receiver.packets_received(), 1);
+
+        // Next valid packet (counter=2) must still be accepted.
+        let mut wire2 = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(2, session_id, plain_text, [0u8; 12], false, &mut wire2).unwrap();
+        wire2.truncate(n);
+        let (len, _) = receiver.decrypt(session_id, &wire2, &mut out).unwrap();
+        assert_eq!(&out[..len], plain_text);
+        assert_eq!(receiver.packets_received(), 2);
+    }
+
+    #[test]
+    fn has_valid_keys_requires_both_self_and_peer() {
+        let mut session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        assert!(!session.has_valid_keys());
+
+        session.update_next_self_key(ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE])).unwrap();
+        session.promote_self_key();
+        assert!(!session.has_valid_keys()); // peer key still missing
+
+        session.update_peer_key(ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE])).unwrap();
+        assert!(session.has_valid_keys());
     }
 }
