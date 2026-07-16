@@ -627,6 +627,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightway-expresslane-cffi"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "lightway-expresslane",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

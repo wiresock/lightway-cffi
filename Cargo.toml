@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/expressvpn/lightway-cffi"
 
 [workspace]
-members = ["lightway-expresslane"]
+members = ["lightway-expresslane", "lightway-expresslane-cffi"]
 
 [lib]
 # cdylib: lightway_cffi.dll + import lib for dynamic linking
