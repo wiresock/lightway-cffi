@@ -139,17 +139,27 @@ pub type he_expresslane_state_change_cb_t = unsafe extern "C" fn(
 ) -> he_return_code_t;
 
 /// Called by the ExpressLane health monitor to read the offloaded packet
-/// counters for `session_id`. When the data path is offloaded (encrypt/decrypt
-/// via `he_expresslane_*` instead of `he_conn_t`), `lightway-core`'s own
-/// counters stay at zero and healthy traffic looks like 100% loss, degrading
-/// the fast path — so register this via `he_ssl_ctx_set_expresslane_metrics_cb`
-/// to report the real counters.
+/// counters. When the data path is offloaded (encrypt/decrypt via
+/// `he_expresslane_*` instead of `he_conn_t`), `lightway-core`'s own counters
+/// stay at zero and healthy traffic looks like 100% loss, degrading the fast
+/// path — so register this via `he_ssl_ctx_set_expresslane_metrics_cb` to
+/// report the real counters.
 ///
-/// The callback must write the session's cumulative packets sent/received into
-/// `*sent` / `*received` (e.g. from `he_expresslane_packets_sent` /
-/// `he_expresslane_packets_received` on the matching `he_expresslane_session_t`)
-/// and return `HE_SUCCESS`. `session_id` points to 8 bytes valid only for the
-/// call. A non-`HE_SUCCESS` return is treated as zero counters.
+/// The callback must write the connection's cumulative ExpressLane packets
+/// sent/received into `*sent` / `*received` (e.g. from
+/// `he_expresslane_packets_sent` / `he_expresslane_packets_received` on the
+/// `he_expresslane_session_t`) and return `HE_SUCCESS`. A non-`HE_SUCCESS`
+/// return is treated as zero counters.
+///
+/// IMPORTANT — identify the session by `conn`, NOT by `session_id`. There is one
+/// offload session per connection, and `conn` is a stable key for it. The
+/// `session_id` argument is `lightway-core`'s *current* view and is only
+/// advisory: during a session-id rotation it can briefly lag the id the offload
+/// has already adopted (core queries metrics while handling a Pong, before it
+/// applies that packet's rotated id). A callback that looked the session up by
+/// an exact `session_id` match would miss during the rotation window, return
+/// zero, and cause a spurious degrade. `session_id` points to 8 bytes valid
+/// only for the call.
 pub type he_expresslane_metrics_cb_t = unsafe extern "C" fn(
     conn: *mut he_conn_t,
     session_id: *const u8,
