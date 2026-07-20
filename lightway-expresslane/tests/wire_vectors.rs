@@ -34,7 +34,14 @@ const IV: [u8; 12] = [0x09u8; 12];
 const PLAINTEXT: &[u8] = b"expresslane golden vector";
 
 fn decode_hex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    assert!(s.len() % 2 == 0, "hex vector must have an even number of digits");
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("hex vector is ASCII");
+            u8::from_str_radix(pair, 16).expect("valid hex digit pair")
+        })
+        .collect()
 }
 
 #[test]
