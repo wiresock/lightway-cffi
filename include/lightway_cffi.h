@@ -241,6 +241,29 @@ typedef enum {
 } he_connection_protocol_t;
 
 /*
+ Classification of a raw inbound datagram by `he_conn_identify_packet`,
+ derived from the cleartext 16-byte lightway wire header.
+ */
+typedef enum {
+    /*
+     Not a valid lightway datagram (too short, or bad magic). Drop it, or
+     hand it to `he_conn_outside_data_received` which will also reject it.
+     */
+    HE_PACKET_KIND_UNDECIDABLE = 0,
+    /*
+     A DTLS / control datagram (`expresslane_data = 0`). Route the whole
+     datagram to `he_conn_outside_data_received`.
+     */
+    HE_PACKET_KIND_CONTROL = 1,
+    /*
+     An ExpressLane data datagram (`expresslane_data = 1`). Strip the
+     16-byte header and decrypt the remainder with
+     `he_expresslane_decrypt`, keyed by the returned `session_id`.
+     */
+    HE_PACKET_KIND_EXPRESSLANE = 2,
+} he_packet_kind_t;
+
+/*
  Packet-padding mode.  Mirrors `he_padding_type` from the OSS C library.
  The Rust `lightway-core` does not currently expose padding control via its
  public API; this enum is provided for source-compatibility with consumers
@@ -466,6 +489,36 @@ typedef he_return_code_t (*he_expresslane_cb_t)(he_conn_t *conn,
 typedef he_return_code_t (*he_expresslane_state_change_cb_t)(he_conn_t *conn,
                                                              he_expresslane_state_t state,
                                                              void *context);
+
+/*
+ Called by the ExpressLane health monitor to read the offloaded packet
+ counters. When the data path is offloaded (encrypt/decrypt via
+ `he_expresslane_*` instead of `he_conn_t`), `lightway-core`'s own counters
+ stay at zero and healthy traffic looks like 100% loss, degrading the fast
+ path — so register this via `he_ssl_ctx_set_expresslane_metrics_cb` to
+ report the real counters.
+
+ The callback must write the connection's cumulative ExpressLane packets
+ sent/received into `*sent` / `*received` (e.g. from
+ `he_expresslane_packets_sent` / `he_expresslane_packets_received` on the
+ `he_expresslane_session_t`) and return `HE_SUCCESS`. A non-`HE_SUCCESS`
+ return is treated as zero counters.
+
+ IMPORTANT — identify the session by `conn`, NOT by `session_id`. There is one
+ offload session per connection, and `conn` is a stable key for it. The
+ `session_id` argument is `lightway-core`'s *current* view and is only
+ advisory: during a session-id rotation it can briefly lag the id the offload
+ has already adopted (core queries metrics while handling a Pong, before it
+ applies that packet's rotated id). A callback that looked the session up by
+ an exact `session_id` match would miss during the rotation window, return
+ zero, and cause a spurious degrade. `session_id` points to 8 bytes valid
+ only for the call.
+ */
+typedef he_return_code_t (*he_expresslane_metrics_cb_t)(he_conn_t *conn,
+                                                        const uint8_t *session_id,
+                                                        uint64_t *sent,
+                                                        uint64_t *received,
+                                                        void *context);
 
 #ifdef __cplusplus
 extern "C" {
@@ -832,6 +885,23 @@ he_return_code_t he_ssl_ctx_set_expresslane_state_change_cb(he_ssl_ctx_t *ssl_ct
                                                             he_expresslane_state_change_cb_t cb);
 
 /*
+ Register the callback that supplies offloaded ExpressLane packet counters
+ to the health monitor.
+
+ Install this whenever the ExpressLane data path is offloaded (decrypt/encrypt
+ via `he_expresslane_decrypt`/`he_expresslane_encrypt` instead of
+ `he_conn_outside_data_received`/`he_conn_inside_packet_received`). Without it,
+ `lightway-core`'s own packet counters stay at zero while the peer reports the
+ real numbers, so the health monitor sees ~100% loss and degrades the fast
+ path back to D/TLS. See `he_expresslane_metrics_cb_t`.
+
+ # Safety
+ `ssl_ctx` must be a valid non-null pointer.
+ */
+he_return_code_t he_ssl_ctx_set_expresslane_metrics_cb(he_ssl_ctx_t *ssl_ctx,
+                                                       he_expresslane_metrics_cb_t cb);
+
+/*
  Set the username for password-based authentication.
 
  # Safety
@@ -960,6 +1030,76 @@ const char *he_conn_get_curve_name(const he_conn_t *conn);
  `client` must be null or a valid pointer from `he_client_create`.
  */
 uint64_t he_conn_get_session_id(const he_client_t *client);
+
+/*
+ Classify a raw inbound datagram by its cleartext 16-byte lightway wire
+ header, without any connection state or decryption.
+
+ This is the demux for an ExpressLane data-plane offload: an
+ `HE_PACKET_KIND_EXPRESSLANE` datagram can be decrypted directly with
+ `he_expresslane_decrypt` after stripping the returned `*header_len` bytes
+ (keyed by the returned `session_id`), while an `HE_PACKET_KIND_CONTROL`
+ datagram must be handed unchanged to `he_conn_outside_data_received`.
+
+ Classification is a pure function of the datagram bytes and delegates to
+ `lightway-core`'s own header parser, so it stays correct across wire-format
+ changes. It does NOT run any outside/obfuscation plugins, so it is only
+ valid when no such plugin is configured (this shim configures none).
+
+ On success `*kind` is always written. For `CONTROL`/`EXPRESSLANE`,
+ `session_id` (if non-null) receives the 8-byte session id and `*header_len`
+ (if non-null) receives the header size (16). A datagram that is not a valid
+ lightway frame yields `HE_PACKET_KIND_UNDECIDABLE` and still returns
+ `HE_SUCCESS` — classification succeeded; the packet simply isn't ours.
+
+ # Safety
+ `packet` must point to `len` readable bytes (may be null iff `len == 0`).
+ `kind` must be a valid non-null pointer. `session_id`, if non-null, must be
+ writable for 8 bytes. `header_len`, if non-null, must be writable.
+ */
+he_return_code_t he_conn_identify_packet(const uint8_t *packet,
+                                         uintptr_t len,
+                                         he_packet_kind_t *kind,
+                                         uint8_t *session_id,
+                                         uintptr_t *header_len);
+
+/*
+ Build the 16-byte cleartext lightway wire header to prepend to an
+ ExpressLane data datagram produced by `he_expresslane_encrypt`. The header
+ carries the connection's protocol version (fixed for a client), the
+ caller-supplied `session_id`, `expresslane_data = 1`, and
+ `aggressive_mode = 0`.
+
+ # Why the caller supplies `session_id`
+ The offload diverts inbound ExpressLane datagrams straight to
+ `he_expresslane_decrypt`, so `lightway-core` never observes their outer
+ header. If the server rotates the session id and the echo arrives only on
+ ExpressLane traffic, the connection's own `session_id()` lags behind — using
+ it here would keep emitting the stale id and the rotation would never
+ complete. The offload is the authority for the ExpressLane session id, so it
+ passes the current one: initially the id from the `he_expresslane_cb_t` key
+ callback, then updated whenever an inbound ExpressLane datagram's header
+ (via `he_conn_identify_packet`) carries a different, successfully-decrypted
+ session id. (Adopt a new id only AFTER `he_expresslane_decrypt` succeeds, so
+ a forged header cannot steer egress.) The DTLS control channel converges
+ independently — the server tolerates a transient session-id mismatch on
+ control packets — so this only governs the ExpressLane egress framing.
+
+ Returns:
+ - `HE_ERR_NULL_POINTER` if `out`, `session_id`, or `client` is null.
+ - `HE_ERR_BAD_PARAM` if `session_id` is the reserved all-zero / rejected
+   sentinel (a header carrying it is unroutable).
+ - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+   re-entrantly from within a callback that already holds the per-client lock.
+
+ # Safety
+ `client` must be null or a valid pointer from `he_client_create`.
+ `session_id` must point to 8 readable bytes. `out` must be writable for 16
+ bytes.
+ */
+he_return_code_t he_conn_build_expresslane_header(const he_client_t *client,
+                                                  const uint8_t *session_id,
+                                                  uint8_t *out);
 
 /*
  Feed an encrypted packet received from the wire into the connection.

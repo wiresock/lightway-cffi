@@ -27,10 +27,11 @@ mod version;
 use bytes::BytesMut;
 use lightway_core::{
     AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
-    OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, TickType,
+    Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, SessionId,
+    TickType,
 };
 
-use cffi_expresslane::CffiExpresslaneCb;
+use cffi_expresslane::{CffiExpresslaneCb, CffiExpresslaneMetrics};
 
 use cffi_event::CffiEventCallback;
 use cffi_io::{CffiInsideIO, CffiOutsideIO};
@@ -492,12 +493,16 @@ fn client_connect_locked(client: &mut he_client_t) -> he_return_code_t {
     };
 
     let ctx_builder = if client.ssl_ctx.enable_expresslane {
-        let b = ctx_builder.with_expresslane(DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL);
+        let mut b = ctx_builder.with_expresslane(DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL);
         if let Some(el_cb) = client.ssl_ctx.expresslane_cb {
-            b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx))
-        } else {
-            b
+            b = b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx));
         }
+        // When the data path is offloaded, feed the offload's packet counters to
+        // the health monitor so it doesn't read core's zeroed counters as loss.
+        if let Some(m_cb) = client.ssl_ctx.expresslane_metrics_cb {
+            b = b.with_expresslane_metrics(CffiExpresslaneMetrics::create(m_cb, conn_ptr, ctx));
+        }
+        b
     } else {
         ctx_builder
     };
@@ -1078,6 +1083,31 @@ pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_state_change_cb(
     he_return_code_t::HE_SUCCESS
 }
 
+/// Register the callback that supplies offloaded ExpressLane packet counters
+/// to the health monitor.
+///
+/// Install this whenever the ExpressLane data path is offloaded (decrypt/encrypt
+/// via `he_expresslane_decrypt`/`he_expresslane_encrypt` instead of
+/// `he_conn_outside_data_received`/`he_conn_inside_packet_received`). Without it,
+/// `lightway-core`'s own packet counters stay at zero while the peer reports the
+/// real numbers, so the health monitor sees ~100% loss and degrades the fast
+/// path back to D/TLS. See `he_expresslane_metrics_cb_t`.
+///
+/// # Safety
+/// `ssl_ctx` must be a valid non-null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_metrics_cb(
+    ssl_ctx: *mut conn::he_ssl_ctx_t,
+    cb: conn::he_expresslane_metrics_cb_t,
+) -> he_return_code_t {
+    if ssl_ctx.is_null() {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
+    unsafe { (*ssl_ctx).expresslane_metrics_cb = Some(cb) };
+    he_return_code_t::HE_SUCCESS
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Connection setters / getters
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1340,6 +1370,189 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
             })
         }
         .unwrap_or(0)
+    })
+}
+
+/// Classify a raw inbound datagram by its cleartext 16-byte lightway wire
+/// header, without any connection state or decryption.
+///
+/// This is the demux for an ExpressLane data-plane offload: an
+/// `HE_PACKET_KIND_EXPRESSLANE` datagram can be decrypted directly with
+/// `he_expresslane_decrypt` after stripping the returned `*header_len` bytes
+/// (keyed by the returned `session_id`), while an `HE_PACKET_KIND_CONTROL`
+/// datagram must be handed unchanged to `he_conn_outside_data_received`.
+///
+/// Classification is a pure function of the datagram bytes and delegates to
+/// `lightway-core`'s own header parser, so it stays correct across wire-format
+/// changes. It does NOT run any outside/obfuscation plugins, so it is only
+/// valid when no such plugin is configured (this shim configures none).
+///
+/// On success `*kind` is always written. For `CONTROL`/`EXPRESSLANE`,
+/// `session_id` (if non-null) receives the 8-byte session id and `*header_len`
+/// (if non-null) receives the header size (16). A datagram that is not a valid
+/// lightway frame yields `HE_PACKET_KIND_UNDECIDABLE` and still returns
+/// `HE_SUCCESS` — classification succeeded; the packet simply isn't ours.
+///
+/// # Safety
+/// `packet` must point to `len` readable bytes (may be null iff `len == 0`).
+/// `kind` must be a valid non-null pointer. `session_id`, if non-null, must be
+/// writable for 8 bytes. `header_len`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_identify_packet(
+    packet: *const u8,
+    len: usize,
+    kind: *mut he_packet_kind_t,
+    session_id: *mut u8,
+    header_len: *mut usize,
+) -> he_return_code_t {
+    if kind.is_null() || (packet.is_null() && len > 0) {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    // Default every out-param before the fallible body, so any return (incl. a
+    // panic mapped to HE_ERR_FAILED, or the UNDECIDABLE arm) leaves safe values
+    // rather than the caller's prior/uninitialised stack contents.
+    // SAFETY: kind is non-null (checked); session_id/header_len are written
+    // only when non-null, per the documented contract.
+    unsafe {
+        *kind = he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE;
+        if !session_id.is_null() {
+            std::ptr::write_bytes(session_id, 0, 8);
+        }
+        if !header_len.is_null() {
+            *header_len = 0;
+        }
+    }
+    // A datagram shorter than the 16-byte header can't be a lightway frame, so
+    // leave it Undecidable (defaulted above) without allocating or parsing.
+    // This also guarantees the read below sees a non-null `packet` valid for
+    // WIRE_SIZE bytes (a null packet only reaches here with len == 0).
+    if len < Header::WIRE_SIZE {
+        return he_return_code_t::HE_SUCCESS;
+    }
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // Only the header window is needed; copy it into a BytesMut for the
+        // parser (which delegates to lightway-core, the wire-format authority).
+        let mut buf = BytesMut::with_capacity(Header::WIRE_SIZE);
+        // SAFETY: len >= WIRE_SIZE (checked above) and packet is non-null, so
+        // it is valid for WIRE_SIZE readable bytes.
+        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(packet, Header::WIRE_SIZE) });
+        // A frame that fails to parse keeps the Undecidable / zero defaults
+        // written above.
+        if let Ok(hdr) = Header::try_from_wire(&mut buf) {
+            // SAFETY: kind is non-null (checked above).
+            unsafe {
+                *kind = if hdr.expresslane_data {
+                    he_packet_kind_t::HE_PACKET_KIND_EXPRESSLANE
+                } else {
+                    he_packet_kind_t::HE_PACKET_KIND_CONTROL
+                };
+            }
+            if !session_id.is_null() {
+                // SAFETY: caller guarantees session_id is writable for 8 bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(hdr.session.as_bytes().as_ptr(), session_id, 8)
+                };
+            }
+            if !header_len.is_null() {
+                // SAFETY: caller guarantees header_len is writable.
+                unsafe { *header_len = Header::WIRE_SIZE };
+            }
+        }
+        he_return_code_t::HE_SUCCESS
+    })
+}
+
+/// Build the 16-byte cleartext lightway wire header to prepend to an
+/// ExpressLane data datagram produced by `he_expresslane_encrypt`. The header
+/// carries the connection's protocol version (fixed for a client), the
+/// caller-supplied `session_id`, `expresslane_data = 1`, and
+/// `aggressive_mode = 0`.
+///
+/// # Why the caller supplies `session_id`
+/// The offload diverts inbound ExpressLane datagrams straight to
+/// `he_expresslane_decrypt`, so `lightway-core` never observes their outer
+/// header. If the server rotates the session id and the echo arrives only on
+/// ExpressLane traffic, the connection's own `session_id()` lags behind — using
+/// it here would keep emitting the stale id and the rotation would never
+/// complete. The offload is the authority for the ExpressLane session id, so it
+/// passes the current one: initially the id from the `he_expresslane_cb_t` key
+/// callback, then updated whenever an inbound ExpressLane datagram's header
+/// (via `he_conn_identify_packet`) carries a different, successfully-decrypted
+/// session id. (Adopt a new id only AFTER `he_expresslane_decrypt` succeeds, so
+/// a forged header cannot steer egress.) The DTLS control channel converges
+/// independently — the server tolerates a transient session-id mismatch on
+/// control packets — so this only governs the ExpressLane egress framing.
+///
+/// Returns:
+/// - `HE_ERR_NULL_POINTER` if `out`, `session_id`, or `client` is null.
+/// - `HE_ERR_BAD_PARAM` if `session_id` is the reserved all-zero / rejected
+///   sentinel (a header carrying it is unroutable).
+/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+///   re-entrantly from within a callback that already holds the per-client lock.
+///
+/// # Safety
+/// `client` must be null or a valid pointer from `he_client_create`.
+/// `session_id` must point to 8 readable bytes. `out` must be writable for 16
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_build_expresslane_header(
+    client: *const he_client_t,
+    session_id: *const u8,
+    out: *mut u8,
+) -> he_return_code_t {
+    // Check all null pointers first so HE_ERR_NULL_POINTER always takes
+    // precedence over the reserved-session HE_ERR_BAD_PARAM check below (a null
+    // `client` is otherwise only caught later, inside lock_client).
+    if out.is_null() || session_id.is_null() || client.is_null() {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    // SAFETY: session_id is non-null (checked) and points to 8 readable bytes
+    // per the documented contract.
+    let sid_bytes: [u8; 8] = unsafe { std::slice::from_raw_parts(session_id, 8) }
+        .try_into()
+        .expect("slice has exactly 8 bytes");
+    let session = SessionId::from_const(sid_bytes);
+    // A header carrying the reserved (unassigned / rejected) session is
+    // unroutable; reject it rather than emit a packet the peer would drop.
+    if session.is_reserved() {
+        return he_return_code_t::HE_ERR_BAD_PARAM;
+    }
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // SAFETY: lock_client null-checks and serialises access; the cast to
+        // *mut is sound because we only read the connection under the lock.
+        let result = unsafe {
+            lock_client(client as *mut he_client_t, |client| {
+                let Some(ref conn) = client.connection else {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                };
+                let hdr = Header {
+                    // For a client, tunnel_protocol_version is fixed at connect
+                    // and equals the version lightway-core stamps on egress.
+                    version: conn.tunnel_protocol_version(),
+                    aggressive_mode: false,
+                    expresslane_data: true,
+                    session,
+                };
+                let mut bm = BytesMut::with_capacity(Header::WIRE_SIZE);
+                hdr.append_to_wire(&mut bm);
+                Ok(bm)
+            })
+        };
+        match result {
+            // `append_to_wire` always writes exactly WIRE_SIZE bytes; the guard
+            // makes that a checked precondition of the copy rather than an
+            // assumption, so a future change that wrote fewer bytes fails fast
+            // instead of copying uninitialised memory across the FFI boundary.
+            Ok(Ok(bm)) if bm.len() >= Header::WIRE_SIZE => {
+                // SAFETY: out is non-null (checked) and writable for 16 bytes
+                // per the documented contract; `bm` holds >= WIRE_SIZE
+                // initialised bytes (guard above) and is a distinct buffer.
+                unsafe { std::ptr::copy_nonoverlapping(bm.as_ptr(), out, Header::WIRE_SIZE) };
+                he_return_code_t::HE_SUCCESS
+            }
+            Ok(Ok(_)) => he_return_code_t::HE_ERR_FAILED,
+            Ok(Err(code)) | Err(code) => code,
+        }
     })
 }
 
@@ -1804,6 +2017,119 @@ mod tests {
             fatal_disconnect(client);
             assert_eq!(DISCONNECTED_HITS.load(std::sync::atomic::Ordering::SeqCst), 1);
 
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn identify_packet_classifies_control_and_expresslane() {
+        use lightway_core::{Header, SessionId, Version};
+        let session = SessionId::from_const([1, 2, 3, 4, 5, 6, 7, 8]);
+
+        for (expresslane, expected) in [
+            (false, he_packet_kind_t::HE_PACKET_KIND_CONTROL),
+            (true, he_packet_kind_t::HE_PACKET_KIND_EXPRESSLANE),
+        ] {
+            let hdr = Header {
+                version: Version::MAXIMUM,
+                aggressive_mode: false,
+                expresslane_data: expresslane,
+                session,
+            };
+            let mut wire = BytesMut::new();
+            hdr.append_to_wire(&mut wire);
+            wire.extend_from_slice(b"payload-after-the-header"); // ignored by classify
+
+            let mut kind = he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE;
+            let mut sid = [0u8; 8];
+            let mut hlen = 0usize;
+            // SAFETY: valid buffer + out-params.
+            let rc = unsafe {
+                he_conn_identify_packet(wire.as_ptr(), wire.len(), &mut kind, sid.as_mut_ptr(), &mut hlen)
+            };
+            assert_eq!(rc, he_return_code_t::HE_SUCCESS);
+            assert_eq!(kind, expected);
+            assert_eq!(sid, [1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(hlen, 16);
+        }
+    }
+
+    #[test]
+    fn identify_packet_rejects_bad_magic_short_and_null() {
+        // Bad magic → Undecidable, still HE_SUCCESS; out-params defaulted even
+        // though they carried non-default junk before the call.
+        let bad = [0u8; 20];
+        let mut kind = he_packet_kind_t::HE_PACKET_KIND_CONTROL;
+        let mut sid = [0xAAu8; 8];
+        let mut hlen = 999usize;
+        // SAFETY: valid buffer + out-params.
+        let rc = unsafe {
+            he_conn_identify_packet(bad.as_ptr(), bad.len(), &mut kind, sid.as_mut_ptr(), &mut hlen)
+        };
+        assert_eq!(rc, he_return_code_t::HE_SUCCESS);
+        assert_eq!(kind, he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE);
+        assert_eq!(sid, [0u8; 8], "session_id defaulted to zero on undecidable");
+        assert_eq!(hlen, 0, "header_len defaulted to zero on undecidable");
+
+        // Shorter than the 16-byte header → Undecidable.
+        let short = *b"He\x01\x03\x00\x01";
+        let mut kind2 = he_packet_kind_t::HE_PACKET_KIND_CONTROL;
+        // SAFETY: valid buffer.
+        let rc2 = unsafe {
+            he_conn_identify_packet(short.as_ptr(), short.len(), &mut kind2, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc2, he_return_code_t::HE_SUCCESS);
+        assert_eq!(kind2, he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE);
+
+        // Null kind pointer, and null packet with len > 0 → NULL_POINTER.
+        // SAFETY: intentional null args.
+        assert_eq!(
+            unsafe {
+                he_conn_identify_packet(bad.as_ptr(), bad.len(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            he_return_code_t::HE_ERR_NULL_POINTER
+        );
+        // SAFETY: intentional null packet with non-zero len.
+        assert_eq!(
+            unsafe {
+                he_conn_identify_packet(std::ptr::null(), 20, &mut kind, std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            he_return_code_t::HE_ERR_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn build_expresslane_header_rejects_bad_inputs() {
+        // SAFETY: create/destroy a client; no connection is established.
+        unsafe {
+            let c = he_client_create();
+            let sid = [1u8; 8];
+            let mut out = [0u8; 16];
+            // A valid session but no connection yet → not ready.
+            assert_eq!(
+                he_conn_build_expresslane_header(c, sid.as_ptr(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
+            );
+            // Reserved all-zero session → bad param (rejected before the lock).
+            assert_eq!(
+                he_conn_build_expresslane_header(c, [0u8; 8].as_ptr(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_BAD_PARAM
+            );
+            // Null out / null session_id → null pointer.
+            assert_eq!(
+                he_conn_build_expresslane_header(c, sid.as_ptr(), std::ptr::null_mut()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            assert_eq!(
+                he_conn_build_expresslane_header(c, std::ptr::null(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            // Null client → NULL_POINTER, and it must win over the reserved-
+            // session BAD_PARAM check (both bad here).
+            assert_eq!(
+                he_conn_build_expresslane_header(std::ptr::null(), [0u8; 8].as_ptr(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
             he_client_destroy(c);
         }
     }
