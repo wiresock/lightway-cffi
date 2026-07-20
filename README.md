@@ -8,6 +8,17 @@ Consumers such as `kp_pkf_client` can link against `lightway_cffi.dll` /
 `lightway_cffi.lib` and include `include/lightway_cffi.h` without any source
 changes to their existing `lightway_tunnel.h` call sites.
 
+## Related crate: lightway-expresslane-cffi
+
+This repo also contains
+[`lightway-expresslane-cffi`](lightway-expresslane-cffi/README.md), a second,
+independent C ABI for out-of-process ExpressLane data-packet encrypt/decrypt
+— e.g. for a Windows driver-adjacent process that needs packet crypto without
+linking this crate's full TLS/wolfssl-dependent client. It links only
+`lightway-expresslane`, a pure-Rust reimplementation of the ExpressLane
+data-packet wire protocol, and ships as its own `lightway_expresslane_cffi`
+library with its own header.
+
 ## Features
 
 - Full Lightway client connection lifecycle (`he_client_create`, `he_client_connect`, …)

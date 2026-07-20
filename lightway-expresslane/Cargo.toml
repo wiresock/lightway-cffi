@@ -1,0 +1,19 @@
+[package]
+name = "lightway-expresslane"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust ExpressLane data-packet encrypt/decrypt primitives, independent of lightway-core."
+license = "AGPL-3.0-only"
+repository = "https://github.com/expressvpn/lightway-cffi"
+
+[lib]
+crate-type = ["rlib"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[dependencies]
+# `zeroize` scrubs the expanded AES key schedule from memory when a Cipher is
+# dropped (key rotation / session teardown).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }

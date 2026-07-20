@@ -1,0 +1,23 @@
+[package]
+name = "lightway-expresslane-cffi"
+version = "0.1.0"
+edition = "2024"
+description = "C ABI for ExpressLane data-packet encrypt/decrypt primitives (lightway-expresslane)."
+license = "AGPL-3.0-only"
+repository = "https://github.com/expressvpn/lightway-cffi"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+lightway-expresslane = { path = "../lightway-expresslane" }
+# Scrub the stack copy of raw key material after installing it into a session.
+zeroize = "1"
+
+[build-dependencies]
+cbindgen = "0.29"

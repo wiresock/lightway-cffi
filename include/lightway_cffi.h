@@ -441,6 +441,13 @@ typedef struct {
      256-bit AES/ChaCha key for packets **received** by this endpoint.
      */
     uint8_t peer_key[32];
+    /*
+     Negotiated ExpressLane wire version (1 = V1, 2 = V2). Selects the AEAD
+     AAD layout: a consumer driving `lightway-expresslane-cffi` must pass
+     this exact value to `he_expresslane_session_create`, since guessing
+     wrong makes every data packet fail authentication.
+     */
+    uint8_t version;
 } he_expresslane_keys_t;
 
 /*
