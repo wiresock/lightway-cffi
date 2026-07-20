@@ -22,8 +22,8 @@ impl std::fmt::Display for ExpresslaneError {
         let s = match self {
             Self::InsufficientData => "insufficient data",
             Self::BufferTooSmall => "output buffer too small",
-            Self::InvalidData => "invalid express data",
-            Self::Replayed => "replayed express data packet",
+            Self::InvalidData => "invalid ExpressLane data packet",
+            Self::Replayed => "replayed ExpressLane data packet",
             Self::KeyNotSet => "key not set",
             Self::InvalidKey => "invalid key",
         };
