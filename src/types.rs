@@ -159,6 +159,23 @@ pub enum he_connection_type_t {
     HE_CONNECTION_TYPE_STREAM = 1,
 }
 
+/// Classification of a raw inbound datagram by `he_conn_identify_packet`,
+/// derived from the cleartext 16-byte lightway wire header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum he_packet_kind_t {
+    /// Not a valid lightway datagram (too short, or bad magic). Drop it, or
+    /// hand it to `he_conn_outside_data_received` which will also reject it.
+    HE_PACKET_KIND_UNDECIDABLE = 0,
+    /// A DTLS / control datagram (`expresslane_data = 0`). Route the whole
+    /// datagram to `he_conn_outside_data_received`.
+    HE_PACKET_KIND_CONTROL = 1,
+    /// An ExpressLane data datagram (`expresslane_data = 1`). Strip the
+    /// 16-byte header and decrypt the remainder with
+    /// `he_expresslane_decrypt`, keyed by the returned `session_id`.
+    HE_PACKET_KIND_EXPRESSLANE = 2,
+}
+
 /// The negotiated D/TLS protocol version.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

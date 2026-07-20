@@ -241,6 +241,29 @@ typedef enum {
 } he_connection_protocol_t;
 
 /*
+ Classification of a raw inbound datagram by `he_conn_identify_packet`,
+ derived from the cleartext 16-byte lightway wire header.
+ */
+typedef enum {
+    /*
+     Not a valid lightway datagram (too short, or bad magic). Drop it, or
+     hand it to `he_conn_outside_data_received` which will also reject it.
+     */
+    HE_PACKET_KIND_UNDECIDABLE = 0,
+    /*
+     A DTLS / control datagram (`expresslane_data = 0`). Route the whole
+     datagram to `he_conn_outside_data_received`.
+     */
+    HE_PACKET_KIND_CONTROL = 1,
+    /*
+     An ExpressLane data datagram (`expresslane_data = 1`). Strip the
+     16-byte header and decrypt the remainder with
+     `he_expresslane_decrypt`, keyed by the returned `session_id`.
+     */
+    HE_PACKET_KIND_EXPRESSLANE = 2,
+} he_packet_kind_t;
+
+/*
  Packet-padding mode.  Mirrors `he_padding_type` from the OSS C library.
  The Rust `lightway-core` does not currently expose padding control via its
  public API; this enum is provided for source-compatibility with consumers
@@ -960,6 +983,58 @@ const char *he_conn_get_curve_name(const he_conn_t *conn);
  `client` must be null or a valid pointer from `he_client_create`.
  */
 uint64_t he_conn_get_session_id(const he_client_t *client);
+
+/*
+ Classify a raw inbound datagram by its cleartext 16-byte lightway wire
+ header, without any connection state or decryption.
+
+ This is the demux for an ExpressLane data-plane offload: an
+ `HE_PACKET_KIND_EXPRESSLANE` datagram can be decrypted directly with
+ `he_expresslane_decrypt` after stripping the returned `*header_len` bytes
+ (keyed by the returned `session_id`), while an `HE_PACKET_KIND_CONTROL`
+ datagram must be handed unchanged to `he_conn_outside_data_received`.
+
+ Classification is a pure function of the datagram bytes and delegates to
+ `lightway-core`'s own header parser, so it stays correct across wire-format
+ changes. It does NOT run any outside/obfuscation plugins, so it is only
+ valid when no such plugin is configured (this shim configures none).
+
+ On success `*kind` is always written. For `CONTROL`/`EXPRESSLANE`,
+ `session_id` (if non-null) receives the 8-byte session id and `*header_len`
+ (if non-null) receives the header size (16). A datagram that is not a valid
+ lightway frame yields `HE_PACKET_KIND_UNDECIDABLE` and still returns
+ `HE_SUCCESS` — classification succeeded; the packet simply isn't ours.
+
+ # Safety
+ `packet` must point to `len` readable bytes (may be null iff `len == 0`).
+ `kind` must be a valid non-null pointer. `session_id`, if non-null, must be
+ writable for 8 bytes. `header_len`, if non-null, must be writable.
+ */
+he_return_code_t he_conn_identify_packet(const uint8_t *packet,
+                                         uintptr_t len,
+                                         he_packet_kind_t *kind,
+                                         uint8_t *session_id,
+                                         uintptr_t *header_len);
+
+/*
+ Build the 16-byte cleartext lightway wire header to prepend to an
+ ExpressLane data datagram produced by `he_expresslane_encrypt`, using the
+ connection's negotiated protocol version and current session id — the
+ authoritative source, so offload egress framing matches what `lightway-core`
+ emits for control traffic on the same flow. The `expresslane_data` flag is
+ set and `aggressive_mode` is cleared.
+
+ The session id / version change rarely (only at handshake / session
+ rotation), so callers should cache the result and rebuild it on a
+ state-change or when `he_conn_get_session_id` changes.
+
+ Returns `HE_ERR_INVALID_CONN_STATE` if no connection is active yet.
+
+ # Safety
+ `client` must be null or a valid pointer from `he_client_create`. `out`
+ must be writable for 16 bytes.
+ */
+he_return_code_t he_conn_build_expresslane_header(const he_client_t *client, uint8_t *out);
 
 /*
  Feed an encrypted packet received from the wire into the connection.

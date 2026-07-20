@@ -27,7 +27,7 @@ mod version;
 use bytes::BytesMut;
 use lightway_core::{
     AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
-    OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, TickType,
+    Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, TickType,
 };
 
 use cffi_expresslane::CffiExpresslaneCb;
@@ -1343,6 +1343,134 @@ pub unsafe extern "C" fn he_conn_get_session_id(client: *const he_client_t) -> u
     })
 }
 
+/// Classify a raw inbound datagram by its cleartext 16-byte lightway wire
+/// header, without any connection state or decryption.
+///
+/// This is the demux for an ExpressLane data-plane offload: an
+/// `HE_PACKET_KIND_EXPRESSLANE` datagram can be decrypted directly with
+/// `he_expresslane_decrypt` after stripping the returned `*header_len` bytes
+/// (keyed by the returned `session_id`), while an `HE_PACKET_KIND_CONTROL`
+/// datagram must be handed unchanged to `he_conn_outside_data_received`.
+///
+/// Classification is a pure function of the datagram bytes and delegates to
+/// `lightway-core`'s own header parser, so it stays correct across wire-format
+/// changes. It does NOT run any outside/obfuscation plugins, so it is only
+/// valid when no such plugin is configured (this shim configures none).
+///
+/// On success `*kind` is always written. For `CONTROL`/`EXPRESSLANE`,
+/// `session_id` (if non-null) receives the 8-byte session id and `*header_len`
+/// (if non-null) receives the header size (16). A datagram that is not a valid
+/// lightway frame yields `HE_PACKET_KIND_UNDECIDABLE` and still returns
+/// `HE_SUCCESS` — classification succeeded; the packet simply isn't ours.
+///
+/// # Safety
+/// `packet` must point to `len` readable bytes (may be null iff `len == 0`).
+/// `kind` must be a valid non-null pointer. `session_id`, if non-null, must be
+/// writable for 8 bytes. `header_len`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_identify_packet(
+    packet: *const u8,
+    len: usize,
+    kind: *mut he_packet_kind_t,
+    session_id: *mut u8,
+    header_len: *mut usize,
+) -> he_return_code_t {
+    if kind.is_null() || (packet.is_null() && len > 0) {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // Only the header window is needed; copy it into a BytesMut for the
+        // parser. A datagram shorter than the header simply fails to parse.
+        let n = len.min(Header::WIRE_SIZE);
+        let mut buf = BytesMut::with_capacity(n);
+        if n > 0 {
+            // SAFETY: packet is valid for `len` (>= n) readable bytes when len > 0.
+            buf.extend_from_slice(unsafe { std::slice::from_raw_parts(packet, n) });
+        }
+        let (k, sid) = match Header::try_from_wire(&mut buf) {
+            Ok(hdr) => {
+                let k = if hdr.expresslane_data {
+                    he_packet_kind_t::HE_PACKET_KIND_EXPRESSLANE
+                } else {
+                    he_packet_kind_t::HE_PACKET_KIND_CONTROL
+                };
+                (k, Some(*hdr.session.as_bytes()))
+            }
+            Err(_) => (he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE, None),
+        };
+        // SAFETY: kind is non-null (checked above).
+        unsafe { *kind = k };
+        if let Some(sid) = sid {
+            if !session_id.is_null() {
+                // SAFETY: caller guarantees session_id is writable for 8 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(sid.as_ptr(), session_id, 8) };
+            }
+            if !header_len.is_null() {
+                // SAFETY: caller guarantees header_len is writable.
+                unsafe { *header_len = Header::WIRE_SIZE };
+            }
+        }
+        he_return_code_t::HE_SUCCESS
+    })
+}
+
+/// Build the 16-byte cleartext lightway wire header to prepend to an
+/// ExpressLane data datagram produced by `he_expresslane_encrypt`, using the
+/// connection's negotiated protocol version and current session id — the
+/// authoritative source, so offload egress framing matches what `lightway-core`
+/// emits for control traffic on the same flow. The `expresslane_data` flag is
+/// set and `aggressive_mode` is cleared.
+///
+/// The session id / version change rarely (only at handshake / session
+/// rotation), so callers should cache the result and rebuild it on a
+/// state-change or when `he_conn_get_session_id` changes.
+///
+/// Returns `HE_ERR_INVALID_CONN_STATE` if no connection is active yet.
+///
+/// # Safety
+/// `client` must be null or a valid pointer from `he_client_create`. `out`
+/// must be writable for 16 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_build_expresslane_header(
+    client: *const he_client_t,
+    out: *mut u8,
+) -> he_return_code_t {
+    if out.is_null() {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        // SAFETY: lock_client null-checks and serialises access; the cast to
+        // *mut is sound because we only read the connection under the lock.
+        let result = unsafe {
+            lock_client(client as *mut he_client_t, |client| {
+                let Some(ref conn) = client.connection else {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                };
+                let hdr = Header {
+                    version: conn.tunnel_protocol_version(),
+                    aggressive_mode: false,
+                    expresslane_data: true,
+                    session: conn.session_id(),
+                };
+                let mut bm = BytesMut::with_capacity(Header::WIRE_SIZE);
+                hdr.append_to_wire(&mut bm);
+                let mut bytes = [0u8; Header::WIRE_SIZE];
+                bytes.copy_from_slice(&bm[..Header::WIRE_SIZE]);
+                Ok(bytes)
+            })
+        };
+        match result {
+            Ok(Ok(bytes)) => {
+                // SAFETY: out is non-null (checked) and writable for 16 bytes
+                // per the documented contract; bytes is a distinct local.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, Header::WIRE_SIZE) };
+                he_return_code_t::HE_SUCCESS
+            }
+            Ok(Err(code)) | Err(code) => code,
+        }
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Data path
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1804,6 +1932,96 @@ mod tests {
             fatal_disconnect(client);
             assert_eq!(DISCONNECTED_HITS.load(std::sync::atomic::Ordering::SeqCst), 1);
 
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn identify_packet_classifies_control_and_expresslane() {
+        use lightway_core::{Header, SessionId, Version};
+        let session = SessionId::from_const([1, 2, 3, 4, 5, 6, 7, 8]);
+
+        for (expresslane, expected) in [
+            (false, he_packet_kind_t::HE_PACKET_KIND_CONTROL),
+            (true, he_packet_kind_t::HE_PACKET_KIND_EXPRESSLANE),
+        ] {
+            let hdr = Header {
+                version: Version::MAXIMUM,
+                aggressive_mode: false,
+                expresslane_data: expresslane,
+                session,
+            };
+            let mut wire = BytesMut::new();
+            hdr.append_to_wire(&mut wire);
+            wire.extend_from_slice(b"payload-after-the-header"); // ignored by classify
+
+            let mut kind = he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE;
+            let mut sid = [0u8; 8];
+            let mut hlen = 0usize;
+            // SAFETY: valid buffer + out-params.
+            let rc = unsafe {
+                he_conn_identify_packet(wire.as_ptr(), wire.len(), &mut kind, sid.as_mut_ptr(), &mut hlen)
+            };
+            assert_eq!(rc, he_return_code_t::HE_SUCCESS);
+            assert_eq!(kind, expected);
+            assert_eq!(sid, [1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(hlen, 16);
+        }
+    }
+
+    #[test]
+    fn identify_packet_rejects_bad_magic_short_and_null() {
+        // Bad magic → Undecidable, still HE_SUCCESS.
+        let bad = [0u8; 20];
+        let mut kind = he_packet_kind_t::HE_PACKET_KIND_CONTROL;
+        // SAFETY: valid buffer, null optional out-params allowed.
+        let rc = unsafe {
+            he_conn_identify_packet(bad.as_ptr(), bad.len(), &mut kind, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, he_return_code_t::HE_SUCCESS);
+        assert_eq!(kind, he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE);
+
+        // Shorter than the 16-byte header → Undecidable.
+        let short = *b"He\x01\x03\x00\x01";
+        let mut kind2 = he_packet_kind_t::HE_PACKET_KIND_CONTROL;
+        // SAFETY: valid buffer.
+        let rc2 = unsafe {
+            he_conn_identify_packet(short.as_ptr(), short.len(), &mut kind2, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc2, he_return_code_t::HE_SUCCESS);
+        assert_eq!(kind2, he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE);
+
+        // Null kind pointer, and null packet with len > 0 → NULL_POINTER.
+        // SAFETY: intentional null args.
+        assert_eq!(
+            unsafe {
+                he_conn_identify_packet(bad.as_ptr(), bad.len(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            he_return_code_t::HE_ERR_NULL_POINTER
+        );
+        // SAFETY: intentional null packet with non-zero len.
+        assert_eq!(
+            unsafe {
+                he_conn_identify_packet(std::ptr::null(), 20, &mut kind, std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            he_return_code_t::HE_ERR_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn build_expresslane_header_without_connection_is_rejected() {
+        // SAFETY: create/destroy a client; no connection is established.
+        unsafe {
+            let c = he_client_create();
+            let mut out = [0u8; 16];
+            assert_eq!(
+                he_conn_build_expresslane_header(c, out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
+            );
+            assert_eq!(
+                he_conn_build_expresslane_header(c, std::ptr::null_mut()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
             he_client_destroy(c);
         }
     }
