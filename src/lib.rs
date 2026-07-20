@@ -27,7 +27,8 @@ mod version;
 use bytes::BytesMut;
 use lightway_core::{
     AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
-    Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, TickType,
+    Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, SessionId,
+    TickType,
 };
 
 use cffi_expresslane::CffiExpresslaneCb;
@@ -1433,36 +1434,56 @@ pub unsafe extern "C" fn he_conn_identify_packet(
 }
 
 /// Build the 16-byte cleartext lightway wire header to prepend to an
-/// ExpressLane data datagram produced by `he_expresslane_encrypt`, using the
-/// connection's protocol version and current session id. For a client
-/// connection (the only kind this shim builds) these match what `lightway-core`
-/// stamps on control traffic over the same flow, so offloaded ExpressLane
-/// datagrams frame identically. The `expresslane_data` flag is set and
-/// `aggressive_mode` is cleared.
+/// ExpressLane data datagram produced by `he_expresslane_encrypt`. The header
+/// carries the connection's protocol version (fixed for a client), the
+/// caller-supplied `session_id`, `expresslane_data = 1`, and
+/// `aggressive_mode = 0`.
 ///
-/// A session id is only assigned once the handshake completes, so this returns
-/// `HE_ERR_INVALID_CONN_STATE` until then (rather than emitting a header with
-/// the reserved all-zero session that the peer would drop). The session id /
-/// version change rarely (only at handshake / session rotation), so callers
-/// should cache the result and rebuild it on a state change or when
-/// `he_conn_get_session_id` changes.
+/// # Why the caller supplies `session_id`
+/// The offload diverts inbound ExpressLane datagrams straight to
+/// `he_expresslane_decrypt`, so `lightway-core` never observes their outer
+/// header. If the server rotates the session id and the echo arrives only on
+/// ExpressLane traffic, the connection's own `session_id()` lags behind — using
+/// it here would keep emitting the stale id and the rotation would never
+/// complete. The offload is the authority for the ExpressLane session id, so it
+/// passes the current one: initially the id from the `he_expresslane_cb_t` key
+/// callback, then updated whenever an inbound ExpressLane datagram's header
+/// (via `he_conn_identify_packet`) carries a different, successfully-decrypted
+/// session id. (Adopt a new id only AFTER `he_expresslane_decrypt` succeeds, so
+/// a forged header cannot steer egress.) The DTLS control channel converges
+/// independently — the server tolerates a transient session-id mismatch on
+/// control packets — so this only governs the ExpressLane egress framing.
 ///
 /// Returns:
-/// - `HE_ERR_NULL_POINTER` if `out` or `client` is null.
-/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, if the session
-///   is not yet established, or if called re-entrantly from within a callback
-///   that already holds the per-client lock.
+/// - `HE_ERR_NULL_POINTER` if `out`, `session_id`, or `client` is null.
+/// - `HE_ERR_BAD_PARAM` if `session_id` is the reserved all-zero / rejected
+///   sentinel (a header carrying it is unroutable).
+/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+///   re-entrantly from within a callback that already holds the per-client lock.
 ///
 /// # Safety
-/// `client` must be null or a valid pointer from `he_client_create`. `out`
-/// must be writable for 16 bytes.
+/// `client` must be null or a valid pointer from `he_client_create`.
+/// `session_id` must point to 8 readable bytes. `out` must be writable for 16
+/// bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_conn_build_expresslane_header(
     client: *const he_client_t,
+    session_id: *const u8,
     out: *mut u8,
 ) -> he_return_code_t {
-    if out.is_null() {
+    if out.is_null() || session_id.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    // SAFETY: session_id is non-null (checked) and points to 8 readable bytes
+    // per the documented contract.
+    let sid_bytes: [u8; 8] = unsafe { std::slice::from_raw_parts(session_id, 8) }
+        .try_into()
+        .expect("slice has exactly 8 bytes");
+    let session = SessionId::from_const(sid_bytes);
+    // A header carrying the reserved (unassigned / rejected) session is
+    // unroutable; reject it rather than emit a packet the peer would drop.
+    if session.is_reserved() {
+        return he_return_code_t::HE_ERR_BAD_PARAM;
     }
     ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
         // SAFETY: lock_client null-checks and serialises access; the cast to
@@ -1472,13 +1493,6 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
                 let Some(ref conn) = client.connection else {
                     return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                 };
-                let session = conn.session_id();
-                // Before the handshake assigns a session, session_id() is the
-                // reserved all-zero EMPTY value; a header carrying it is
-                // unroutable, so report "not ready" instead of success.
-                if session.is_reserved() {
-                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
-                }
                 let hdr = Header {
                     // For a client, tunnel_protocol_version is fixed at connect
                     // and equals the version lightway-core stamps on egress.
@@ -2053,17 +2067,29 @@ mod tests {
     }
 
     #[test]
-    fn build_expresslane_header_without_connection_is_rejected() {
+    fn build_expresslane_header_rejects_bad_inputs() {
         // SAFETY: create/destroy a client; no connection is established.
         unsafe {
             let c = he_client_create();
+            let sid = [1u8; 8];
             let mut out = [0u8; 16];
+            // A valid session but no connection yet → not ready.
             assert_eq!(
-                he_conn_build_expresslane_header(c, out.as_mut_ptr()),
+                he_conn_build_expresslane_header(c, sid.as_ptr(), out.as_mut_ptr()),
                 he_return_code_t::HE_ERR_INVALID_CONN_STATE
             );
+            // Reserved all-zero session → bad param (rejected before the lock).
             assert_eq!(
-                he_conn_build_expresslane_header(c, std::ptr::null_mut()),
+                he_conn_build_expresslane_header(c, [0u8; 8].as_ptr(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_BAD_PARAM
+            );
+            // Null out / null session_id → null pointer.
+            assert_eq!(
+                he_conn_build_expresslane_header(c, sid.as_ptr(), std::ptr::null_mut()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            assert_eq!(
+                he_conn_build_expresslane_header(c, std::ptr::null(), out.as_mut_ptr()),
                 he_return_code_t::HE_ERR_NULL_POINTER
             );
             he_client_destroy(c);

@@ -1018,31 +1018,41 @@ he_return_code_t he_conn_identify_packet(const uint8_t *packet,
 
 /*
  Build the 16-byte cleartext lightway wire header to prepend to an
- ExpressLane data datagram produced by `he_expresslane_encrypt`, using the
- connection's protocol version and current session id. For a client
- connection (the only kind this shim builds) these match what `lightway-core`
- stamps on control traffic over the same flow, so offloaded ExpressLane
- datagrams frame identically. The `expresslane_data` flag is set and
- `aggressive_mode` is cleared.
+ ExpressLane data datagram produced by `he_expresslane_encrypt`. The header
+ carries the connection's protocol version (fixed for a client), the
+ caller-supplied `session_id`, `expresslane_data = 1`, and
+ `aggressive_mode = 0`.
 
- A session id is only assigned once the handshake completes, so this returns
- `HE_ERR_INVALID_CONN_STATE` until then (rather than emitting a header with
- the reserved all-zero session that the peer would drop). The session id /
- version change rarely (only at handshake / session rotation), so callers
- should cache the result and rebuild it on a state change or when
- `he_conn_get_session_id` changes.
+ # Why the caller supplies `session_id`
+ The offload diverts inbound ExpressLane datagrams straight to
+ `he_expresslane_decrypt`, so `lightway-core` never observes their outer
+ header. If the server rotates the session id and the echo arrives only on
+ ExpressLane traffic, the connection's own `session_id()` lags behind — using
+ it here would keep emitting the stale id and the rotation would never
+ complete. The offload is the authority for the ExpressLane session id, so it
+ passes the current one: initially the id from the `he_expresslane_cb_t` key
+ callback, then updated whenever an inbound ExpressLane datagram's header
+ (via `he_conn_identify_packet`) carries a different, successfully-decrypted
+ session id. (Adopt a new id only AFTER `he_expresslane_decrypt` succeeds, so
+ a forged header cannot steer egress.) The DTLS control channel converges
+ independently — the server tolerates a transient session-id mismatch on
+ control packets — so this only governs the ExpressLane egress framing.
 
  Returns:
- - `HE_ERR_NULL_POINTER` if `out` or `client` is null.
- - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, if the session
-   is not yet established, or if called re-entrantly from within a callback
-   that already holds the per-client lock.
+ - `HE_ERR_NULL_POINTER` if `out`, `session_id`, or `client` is null.
+ - `HE_ERR_BAD_PARAM` if `session_id` is the reserved all-zero / rejected
+   sentinel (a header carrying it is unroutable).
+ - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+   re-entrantly from within a callback that already holds the per-client lock.
 
  # Safety
- `client` must be null or a valid pointer from `he_client_create`. `out`
- must be writable for 16 bytes.
+ `client` must be null or a valid pointer from `he_client_create`.
+ `session_id` must point to 8 readable bytes. `out` must be writable for 16
+ bytes.
  */
-he_return_code_t he_conn_build_expresslane_header(const he_client_t *client, uint8_t *out);
+he_return_code_t he_conn_build_expresslane_header(const he_client_t *client,
+                                                  const uint8_t *session_id,
+                                                  uint8_t *out);
 
 /*
  Feed an encrypted packet received from the wire into the connection.
