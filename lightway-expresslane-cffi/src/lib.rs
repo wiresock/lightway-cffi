@@ -37,9 +37,10 @@ pub struct he_expresslane_session_t(ExpresslaneSession);
 /// running in V1 mode, which against a peer that negotiated the other version
 /// would make every packet fail authentication with no distinguishing error.
 ///
-/// Returns a heap-allocated pointer, or NULL for an unrecognized version /
-/// allocation failure. The caller must free a non-NULL result with
-/// `he_expresslane_session_destroy`.
+/// Returns a heap-allocated pointer, or NULL for an unrecognized version.
+/// (Allocation failure does not return NULL — Rust's default global allocator
+/// aborts the process on OOM, which `ffi_guard` cannot intercept.) The caller
+/// must free a non-NULL result with `he_expresslane_session_destroy`.
 ///
 /// # Safety
 /// The returned pointer must be freed with `he_expresslane_session_destroy`.
