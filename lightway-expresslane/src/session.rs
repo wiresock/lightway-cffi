@@ -317,6 +317,14 @@ mod tests {
     use super::*;
     use crate::key::EXPRESSLANE_KEY_SIZE;
 
+    /// Deterministic but unique IV derived from the per-packet counter, so
+    /// tests never reuse a `(key, iv)` pair (see `encrypt`'s IV contract).
+    fn iv_for(counter: u64) -> [u8; 12] {
+        let mut iv = [0u8; 12];
+        iv[..8].copy_from_slice(&counter.to_be_bytes());
+        iv
+    }
+
     #[test]
     fn reserve_counter_starts_at_one_and_increments() {
         let session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
@@ -663,9 +671,8 @@ mod tests {
                             let plain_text = format!("thread {t} packet {i}");
                             let mut buf =
                                 vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
-                            let iv = [t as u8; 12];
                             let n = tx
-                                .encrypt(counter, session_id, plain_text.as_bytes(), iv, false, &mut buf)
+                                .encrypt(counter, session_id, plain_text.as_bytes(), iv_for(counter), false, &mut buf)
                                 .unwrap();
                             buf.truncate(n);
                             produced.push(buf);
@@ -718,7 +725,7 @@ mod tests {
                         let counter = tx.reserve_counter();
                         let mut buf = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
                         if let Ok(n) =
-                            tx.encrypt(counter, session_id, plain_text, [0u8; 12], false, &mut buf)
+                            tx.encrypt(counter, session_id, plain_text, iv_for(counter), false, &mut buf)
                         {
                             buf.truncate(n);
                             results.push(buf);

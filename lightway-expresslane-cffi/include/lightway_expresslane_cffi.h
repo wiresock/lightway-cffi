@@ -132,10 +132,11 @@ he_expresslane_session_t *he_expresslane_session_create(uint8_t version);
 void he_expresslane_session_destroy(he_expresslane_session_t *session);
 
 /*
- Reserve a wire counter value guaranteed unique for this session. Safe to
- call concurrently from multiple threads on the same session. Returns 0
- if `session` is null (0 is never a value `reserve_counter` itself would
- return, since it starts at 1).
+ Reserve a wire counter value for this session — unique per call until the
+ internal 64-bit counter wraps (after 2^64 reservations; unreachable in
+ practice). Safe to call concurrently from multiple threads on the same
+ session. Returns 0 if `session` is null; a live session returns 1, 2, 3, …
+ (0 recurs only after the astronomically distant wrap).
 
  # Safety
  `session` must be a valid non-null pointer or null.
