@@ -48,7 +48,7 @@ Implements the same wire format and same state as
 
 - `ExpresslaneKey([u8; 32])`
 - `ExpresslaneVersion { Unknown, Version1, Version2 }` (controls AAD layout:
-  V2 binds the flags byte into the AAD, V1 doesn't)
+  V2 binds the 16-bit flags field into the AAD, V1 doesn't)
 - `ExpresslaneSession` — holds the 4-key rotation state
   (`current_self`/`next_self`/`current_peer`/`prev_peer`) and an 8192-bit
   (128 × u64) replay window, same semantics as `ReplayWindow` in

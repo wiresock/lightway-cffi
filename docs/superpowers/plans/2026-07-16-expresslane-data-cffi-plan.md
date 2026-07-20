@@ -344,16 +344,16 @@ Add to `lightway-expresslane/src/version.rs` (above the `#[cfg(test)]` module):
 
 ```rust
 /// ExpressLane wire-format version. Controls whether the AEAD associated
-/// data includes the flags byte (`Version2`) or not (`Version1`).
+/// data includes the flags field (`Version2`) or not (`Version1`).
 #[repr(u8)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Default)]
 pub enum ExpresslaneVersion {
     /// Not yet negotiated / not recognised by this build.
     #[default]
     Unknown = 0,
-    /// Initial ExpressLane wire format (AAD omits the flags byte).
+    /// Initial ExpressLane wire format (AAD omits the flags field).
     Version1 = 1,
-    /// Same wire layout as V1, but the flags byte is bound into the AEAD AAD.
+    /// Same wire layout as V1, but the flags field is bound into the AEAD AAD.
     Version2 = 2,
 }
 
@@ -1881,7 +1881,7 @@ pub enum he_expresslane_version_t {
     HE_EXPRESSLANE_VERSION_UNKNOWN = 0,
     /// Initial ExpressLane wire format.
     HE_EXPRESSLANE_VERSION_1 = 1,
-    /// Flags byte bound into the AEAD AAD.
+    /// Full 16-bit flags field bound into the AEAD AAD.
     HE_EXPRESSLANE_VERSION_2 = 2,
 }
 ```

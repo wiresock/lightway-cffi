@@ -1,16 +1,17 @@
 //! ExpressLane wire-format version, controlling AAD layout.
 
 /// ExpressLane wire-format version. Controls whether the AEAD associated
-/// data includes the flags byte (`Version2`) or not (`Version1`).
+/// data includes the 16-bit flags field (`Version2`) or not (`Version1`).
 #[repr(u8)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Default)]
 pub enum ExpresslaneVersion {
     /// Not yet negotiated / not recognised by this build.
     #[default]
     Unknown = 0,
-    /// Initial ExpressLane wire format (AAD omits the flags byte).
+    /// Initial ExpressLane wire format (AAD omits the flags field).
     Version1 = 1,
-    /// Same wire layout as V1, but the flags byte is bound into the AEAD AAD.
+    /// Same wire layout as V1, but the full 16-bit flags field is bound into
+    /// the AEAD AAD.
     Version2 = 2,
 }
 

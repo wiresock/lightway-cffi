@@ -83,7 +83,7 @@ enum he_expresslane_version_t
      */
     HE_EXPRESSLANE_VERSION_1 = 1,
     /*
-     Flags byte bound into the AEAD AAD.
+     Full 16-bit flags field bound into the AEAD AAD.
      */
     HE_EXPRESSLANE_VERSION_2 = 2,
 };
