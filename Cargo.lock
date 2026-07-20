@@ -50,6 +50,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -599,7 +600,7 @@ dependencies = [
 [[package]]
 name = "lightway-core"
 version = "0.1.0"
-source = "git+https://github.com/expressvpn/lightway?rev=4ee75d00406d1fa84f5fdc17e9935a07d77801fe#4ee75d00406d1fa84f5fdc17e9935a07d77801fe"
+source = "git+https://github.com/expressvpn/lightway?rev=cc47e97290499239ed34244e20e058e7373aff4e#cc47e97290499239ed34244e20e058e7373aff4e"
 dependencies = [
  "anyhow",
  "bitfield-struct",
@@ -1561,6 +1562,12 @@ dependencies = [
  "build-target",
  "msbuild",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zmij"
