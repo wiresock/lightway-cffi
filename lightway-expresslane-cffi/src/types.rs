@@ -55,3 +55,21 @@ pub enum he_expresslane_version_t {
     /// Flags byte bound into the AEAD AAD.
     HE_EXPRESSLANE_VERSION_2 = 2,
 }
+
+// This C enum exists only so cbindgen emits the named version constants; the
+// authoritative version type is `lightway_expresslane::ExpresslaneVersion`
+// (which `he_expresslane_session_create` converts a raw u8 through). Keep the
+// discriminants in lock-step so the constants a C caller passes actually map
+// to the intended wire version.
+const _: () = {
+    use lightway_expresslane::ExpresslaneVersion;
+    assert!(
+        he_expresslane_version_t::HE_EXPRESSLANE_VERSION_UNKNOWN as u8 == ExpresslaneVersion::Unknown as u8
+    );
+    assert!(
+        he_expresslane_version_t::HE_EXPRESSLANE_VERSION_1 as u8 == ExpresslaneVersion::Version1 as u8
+    );
+    assert!(
+        he_expresslane_version_t::HE_EXPRESSLANE_VERSION_2 as u8 == ExpresslaneVersion::Version2 as u8
+    );
+};

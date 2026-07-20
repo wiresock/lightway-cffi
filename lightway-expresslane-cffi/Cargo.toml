@@ -16,6 +16,8 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 lightway-expresslane = { path = "../lightway-expresslane" }
+# Scrub the stack copy of raw key material after installing it into a session.
+zeroize = "1"
 
 [build-dependencies]
 cbindgen = "0.29"

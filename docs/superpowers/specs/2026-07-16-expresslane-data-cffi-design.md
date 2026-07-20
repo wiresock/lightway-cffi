@@ -124,16 +124,17 @@ impl ExpresslaneSession {
         out: &mut [u8],
     ) -> ExpresslaneResult<usize>;
 
-    // --- RX domain: caller must externally serialize all calls in this
-    // group against the same session handle (see "Parallel encrypt"). ---
+    // --- RX domain: serialized internally as a unit by the `rx` mutex, so
+    // these are `&self` and safe to call from any thread (see "Parallel
+    // encrypt"). Concurrent RX calls on one session simply take turns. ---
 
-    pub fn has_valid_keys(&mut self) -> bool;
-    pub fn update_peer_key(&mut self, key: ExpresslaneKey) -> ExpresslaneResult<()>;
-    pub fn packets_received(&mut self) -> u64;
+    pub fn has_valid_keys(&self) -> bool;
+    pub fn update_peer_key(&self, key: ExpresslaneKey) -> ExpresslaneResult<()>;
+    pub fn packets_received(&self) -> u64;
 
     /// `out` must be >= `wire_packet.len() - WIRE_OVERHEAD`. Returns (plaintext_len, is_encoded).
     pub fn decrypt(
-        &mut self,
+        &self,
         session_id: [u8; 8],
         wire_packet: &[u8],
         out: &mut [u8],
@@ -144,10 +145,11 @@ impl ExpresslaneSession {
 `session_id` is a plain `[u8; 8]`, not `lightway_core::wire::SessionId` —
 this crate has no dependency on `lightway-core`.
 
-`has_valid_keys`/`packets_received` take `&mut self` even though they only
-read: they're grouped into the RX domain because `has_valid_keys` also
-reads `current_peer`, which is unlocked RX state (see "Parallel encrypt").
-Callers must invoke them from the same serialized context as `decrypt`.
+All RX methods take `&self`; the receive-side state (`current_peer`,
+`prev_peer`, `replay_window`) lives behind the `rx` mutex, so a `decrypt`
+concurrent with `has_valid_keys` on one session is serialized rather than
+undefined behavior. The mutex is uncontended in the intended single-RX-thread
+deployment.
 
 ### 2. `lightway-expresslane-cffi`
 
@@ -198,15 +200,15 @@ he_expresslane_return_code_t he_expresslane_encrypt(
     uint8_t *out, size_t out_capacity,
     size_t *out_len);
 
-/* RX domain — caller must externally serialize all calls in this group
- * against the same session handle (non-const: no internal locking). */
+/* RX domain — serialized internally per session (const handle); safe to call
+ * from any thread, concurrent RX calls simply take turns. */
 he_expresslane_return_code_t he_expresslane_set_peer_key(
-    he_expresslane_session_t *session, const uint8_t key[32]);
-bool he_expresslane_has_valid_keys(he_expresslane_session_t *session);
-uint64_t he_expresslane_packets_received(he_expresslane_session_t *session);
+    const he_expresslane_session_t *session, const uint8_t key[32]);
+bool he_expresslane_has_valid_keys(const he_expresslane_session_t *session);
+uint64_t he_expresslane_packets_received(const he_expresslane_session_t *session);
 
 he_expresslane_return_code_t he_expresslane_decrypt(
-    he_expresslane_session_t *session,
+    const he_expresslane_session_t *session,
     const uint8_t session_id[8],
     const uint8_t *wire_packet, size_t wire_packet_len,
     uint8_t *out, size_t out_capacity,

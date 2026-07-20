@@ -63,8 +63,11 @@ jobs:
           key: ubuntu-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: ubuntu-cargo-
 
-      - name: Build (regenerates include/lightway_cffi.h)
-        run: cargo build
+      - name: Build (regenerates both crates' committed headers)
+        # --workspace so lightway-expresslane-cffi/build.rs also runs; a bare
+        # `cargo build` builds only the root package, leaving that crate's
+        # header un-regenerated so the diff check below could never catch its drift.
+        run: cargo build --workspace
 
       - name: Verify headers are unchanged
         run: |

@@ -102,10 +102,46 @@ pub unsafe extern "C" fn he_expresslane_reserve_counter(
     })
 }
 
+/// Shared body for the key setters: read the 32-byte key, install it into
+/// `session` via `install`, then scrub the stack copy so raw key material
+/// does not linger in reused stack memory (matching the sibling
+/// `lightway-cffi` crate's key-handling discipline).
+///
+/// # Safety
+/// `session` and `key` are dereferenced only after the null checks; `key`
+/// must point to `EXPRESSLANE_KEY_SIZE` readable bytes per each caller's
+/// documented contract.
+fn set_key_from_ptr(
+    session: *const he_expresslane_session_t,
+    key: *const u8,
+    install: impl FnOnce(&ExpresslaneSession, ExpresslaneKey) -> lightway_expresslane::ExpresslaneResult<()>,
+) -> he_expresslane_return_code_t {
+    use zeroize::Zeroize;
+    if session.is_null() || key.is_null() {
+        return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
+    }
+    ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
+        // SAFETY: null checks above; key points to EXPRESSLANE_KEY_SIZE
+        // readable bytes per the caller's documented contract.
+        let mut key_bytes: [u8; EXPRESSLANE_KEY_SIZE] =
+            unsafe { std::slice::from_raw_parts(key, EXPRESSLANE_KEY_SIZE) }
+                .try_into()
+                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
+        // SAFETY: null check above; session is valid for this call.
+        let session = &unsafe { &*session }.0;
+        let rc = match install(session, ExpresslaneKey::from(key_bytes)) {
+            Ok(()) => he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS,
+            Err(e) => e.into(),
+        };
+        key_bytes.zeroize();
+        rc
+    })
+}
+
 /// Stage a new "next self" key. Call `he_expresslane_promote_self_key` once
 /// the peer has acknowledged the rotation to make it the active send key.
 /// Safe to call concurrently with `he_expresslane_encrypt` on the same
-/// session.
+/// session. Returns `HE_EXPRESSLANE_ERR_INVALID_KEY` for an all-zero key.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer. `key` must point to 32
@@ -115,25 +151,7 @@ pub unsafe extern "C" fn he_expresslane_set_next_self_key(
     session: *const he_expresslane_session_t,
     key: *const u8,
 ) -> he_expresslane_return_code_t {
-    if session.is_null() || key.is_null() {
-        return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
-    }
-    ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
-        // SAFETY: null checks above; key points to EXPRESSLANE_KEY_SIZE
-        // readable bytes per the function's documented contract.
-        let key_bytes: [u8; EXPRESSLANE_KEY_SIZE] =
-            unsafe { std::slice::from_raw_parts(key, EXPRESSLANE_KEY_SIZE) }
-                .try_into()
-                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
-        // SAFETY: null check above; session is valid for this call.
-        match unsafe { &*session }
-            .0
-            .update_next_self_key(ExpresslaneKey::from(key_bytes))
-        {
-            Ok(()) => he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS,
-            Err(e) => e.into(),
-        }
-    })
+    set_key_from_ptr(session, key, |s, k| s.update_next_self_key(k))
 }
 
 /// Promote the staged "next self" key to the active send key. A no-op if
@@ -217,6 +235,10 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
     {
         return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
     }
+    // Default the out-param before the fallible body, so any error or panic
+    // return leaves a safe 0 rather than the caller's prior (uninitialized) value.
+    // SAFETY: out_len is non-null (checked above).
+    unsafe { *out_len = 0 };
     ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
         // SAFETY: null checks above; session_id is valid for 8 bytes per
         // this function's documented contract.
@@ -277,25 +299,7 @@ pub unsafe extern "C" fn he_expresslane_set_peer_key(
     session: *const he_expresslane_session_t,
     key: *const u8,
 ) -> he_expresslane_return_code_t {
-    if session.is_null() || key.is_null() {
-        return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
-    }
-    ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
-        // SAFETY: null checks above; key points to EXPRESSLANE_KEY_SIZE
-        // readable bytes per the function's documented contract.
-        let key_bytes: [u8; EXPRESSLANE_KEY_SIZE] =
-            unsafe { std::slice::from_raw_parts(key, EXPRESSLANE_KEY_SIZE) }
-                .try_into()
-                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
-        // SAFETY: null check above; session is valid for this call.
-        match unsafe { &*session }
-            .0
-            .update_peer_key(ExpresslaneKey::from(key_bytes))
-        {
-            Ok(()) => he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS,
-            Err(e) => e.into(),
-        }
-    })
+    set_key_from_ptr(session, key, |s, k| s.update_peer_key(k))
 }
 
 /// True if both a self (send) key and a peer (receive) key are installed.
@@ -370,6 +374,13 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
         || is_encoded.is_null()
     {
         return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
+    }
+    // Default the out-params before the fallible body, so any error or panic
+    // return leaves safe values rather than the caller's prior ones.
+    // SAFETY: out_len / is_encoded are non-null (checked above).
+    unsafe {
+        *out_len = 0;
+        *is_encoded = false;
     }
     ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
         // SAFETY: null checks above; session_id is valid for 8 bytes per

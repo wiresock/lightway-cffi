@@ -59,6 +59,12 @@ impl ReplayWindow {
             for i in (block_shift..Self::NUM_BLOCKS).rev() {
                 self.bitmap[i] = self.bitmap[i - block_shift];
             }
+            // The block-copy loop above leaves [0..block_shift) holding stale
+            // values; clear them. (`block_shift < NUM_BLOCKS` here, guaranteed
+            // by the `count >= WINDOW_SIZE` early return.)
+            for slot in self.bitmap.iter_mut().take(block_shift) {
+                *slot = 0;
+            }
         } else {
             for i in (0..Self::NUM_BLOCKS).rev() {
                 let lower = if i >= block_shift {
@@ -73,10 +79,8 @@ impl ReplayWindow {
                 };
                 self.bitmap[i] = lower | upper;
             }
-        }
-
-        for i in 0..block_shift.min(Self::NUM_BLOCKS) {
-            self.bitmap[i] = 0;
+            // The loop above already writes 0 into every block < block_shift
+            // (both `lower` and `upper` are 0 there), so no extra clear needed.
         }
     }
 

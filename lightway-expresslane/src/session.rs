@@ -112,6 +112,13 @@ impl ExpresslaneSession {
         self.next_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
+    /// Seed the internal counter (test-only) so the wraparound at `u64::MAX`
+    /// can be exercised without 2^64 reservations.
+    #[cfg(test)]
+    fn seed_counter_for_test(&self, v: u64) {
+        self.next_counter.store(v, Ordering::Relaxed);
+    }
+
     /// Stage a new "next self" key. Call `promote_self_key` once the peer
     /// has acknowledged the rotation to make it the active send key.
     ///
@@ -185,7 +192,16 @@ impl ExpresslaneSession {
 
         out[8..20].copy_from_slice(&iv);
         out[40..needed].copy_from_slice(plain_text);
-        let tag = cipher.encrypt(&iv, &aad_buf[..aad_len], &mut out[40..needed])?;
+        let tag = match cipher.encrypt(&iv, &aad_buf[..aad_len], &mut out[40..needed]) {
+            Ok(tag) => tag,
+            Err(e) => {
+                // Unreachable in practice (plain_text.len() is capped at
+                // u16::MAX, far below AES-GCM's length limit), but never leave
+                // the caller's plaintext sitting in `out` on an error return.
+                out[40..needed].fill(0);
+                return Err(e);
+            }
+        };
         drop(guard);
 
         out[0..8].copy_from_slice(&counter.to_be_bytes());
@@ -262,6 +278,14 @@ impl ExpresslaneSession {
         let flags = u16::from_be_bytes(wire_packet[38..40].try_into().unwrap());
         let is_encoded = flags & FLAG_ENCODED != 0;
 
+        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Replay pre-check first (non-mutating; matches lightway-core's
+        // precedence): a replayed counter is rejected before any length work,
+        // AAD construction, key lookup, or writing to `out`.
+        if rx.replay_window.would_reject(counter) {
+            return Err(ExpresslaneError::Replayed);
+        }
         if wire_packet.len() < Self::WIRE_OVERHEAD + data_len {
             return Err(ExpresslaneError::InsufficientData);
         }
@@ -271,25 +295,19 @@ impl ExpresslaneSession {
 
         // Bind the full received flags into the AAD (V2), matching
         // lightway-core: any modified flag bit — including reserved bits —
-        // fails authentication.
+        // fails authentication. Built only after the cheap rejects above.
         let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, flags);
 
-        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Non-mutating replay pre-check before paying the AEAD cost.
-        if rx.replay_window.would_reject(counter) {
-            return Err(ExpresslaneError::Replayed);
-        }
-
-        out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
-
-        // Try the current peer key, then the previous one (rotation
-        // fallback). On authentication failure the cipher leaves `out`
-        // unchanged, so the fallback attempt sees the original ciphertext.
+        // Try the current peer key, then the previous one (rotation fallback).
+        // The caller's `out` is written only from here on, so every error path
+        // above leaves it untouched; on authentication failure the cipher
+        // leaves `out` unchanged, so the fallback attempt sees the original
+        // ciphertext.
         let decrypted = {
             let Some(current) = rx.current_peer.as_ref() else {
                 return Err(ExpresslaneError::KeyNotSet);
             };
+            out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
             current
                 .decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
                 .is_ok()
@@ -874,14 +892,14 @@ mod tests {
     }
 
     #[test]
-    fn reserve_counter_uses_wrapping_arithmetic() {
-        // reserve_counter() uses wrapping_add so it cannot panic in a debug
-        // build when the internal counter reaches u64::MAX (release wrap
-        // sequence ..., MAX, 0, 1 matches lightway-core). Driving 2^64
-        // reservations is infeasible, so this documents the wrap directly.
+    fn reserve_counter_wraps_through_zero_without_panicking() {
+        // reserve_counter() uses wrapping_add, so at the u64::MAX boundary it
+        // must not panic (debug builds) and must produce the sequence
+        // MAX, 0, 1 — matching lightway-core's wire_counter.wrapping_add(1).
         let session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        session.seed_counter_for_test(u64::MAX - 1);
+        assert_eq!(session.reserve_counter(), u64::MAX);
+        assert_eq!(session.reserve_counter(), 0);
         assert_eq!(session.reserve_counter(), 1);
-        assert_eq!(session.reserve_counter(), 2);
-        assert_eq!(u64::MAX.wrapping_add(1), 0);
     }
 }

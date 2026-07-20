@@ -148,7 +148,7 @@ uint64_t he_expresslane_reserve_counter(const he_expresslane_session_t *session)
  Stage a new "next self" key. Call `he_expresslane_promote_self_key` once
  the peer has acknowledged the rotation to make it the active send key.
  Safe to call concurrently with `he_expresslane_encrypt` on the same
- session.
+ session. Returns `HE_EXPRESSLANE_ERR_INVALID_KEY` for an all-zero key.
 
  # Safety
  `session` must be a valid non-null pointer. `key` must point to 32
