@@ -221,10 +221,11 @@ size_t he_expresslane_wire_overhead(void);   // 40 — avoids a magic constant o
 Encrypt throughput matters for the driver use case — a single caller-serialized
 session handle would force all encryption onto one thread. Decrypt doesn't get
 the same treatment: the replay-window bitmap update is inherently ordered, and
-a single RX path per session is the common case, so it stays exclusive.
+a single RX path per session is the common case, so RX calls are simply
+serialized (internally) rather than parallelized.
 
 `ExpresslaneSession` internally splits into two independently-synchronized
-halves:
+halves; every public method takes `&self` and the session is `Sync`:
 
 - **TX state** — `current_self: RwLock<Option<Cipher>>`,
   `next_self: Mutex<Option<Cipher>>`, `wire_counter_high_watermark: AtomicU64`
@@ -233,11 +234,17 @@ halves:
   takes a brief write lock to swap in the staged key. `next_self` sees
   near-zero contention — rotation is driven by one control-plane thread
   processing `ExpresslaneConfig` acks.
-- **RX state** — `current_peer`, `prev_peer`, `replay_window` — plain fields,
-  not internally locked. `decrypt()`, `update_peer_key()`,
-  `has_valid_keys()`, `packets_received()` all require exclusive (`&mut
-  self` in Rust; caller-serialized in C) access, unchanged from a
-  single-threaded model.
+- **RX state** — `current_peer`, `prev_peer`, `replay_window` — held as a
+  unit behind an internal `Mutex` (`rx`). `decrypt()`, `update_peer_key()`,
+  `has_valid_keys()`, `packets_received()` take the lock for the duration of
+  the call, so RX calls from any thread are safe and simply take turns. The
+  lock is uncontended in the intended single-RX-thread deployment; it exists
+  so a stray concurrent RX call (or an RX call concurrent with TX through the
+  C API's shared handle) is merely serialized rather than undefined behavior.
+  An earlier draft kept these as plain unlocked fields with `&mut self` /
+  caller-serialized access, but that contract is not expressible soundly
+  through a shared C handle: a conforming caller running TX (`&`) concurrently
+  with RX (`&mut`) on one session would be aliasing UB in Rust's memory model.
 
 Consequence for the wire counter specifically: `lightway-core`'s
 `ExpresslaneData::append_to_wire` auto-increments its counter as part of the
@@ -272,10 +279,11 @@ every thread encrypting on that session.
 - **Threading**: see "Parallel encrypt" above — TX calls (`encrypt`,
   `reserve_counter`, `update_next_self_key`, `promote_self_key`,
   `packets_sent`) are safe to call concurrently from multiple threads on one
-  session handle. RX calls (`decrypt`, `update_peer_key`, `has_valid_keys`,
-  `packets_received`) must be externally serialized by the caller — no
-  internal locking there, matching the existing `he_conn_t` data-path
-  convention in `lightway-cffi`. Independent session handles never need
+  session handle, and RX calls (`decrypt`, `update_peer_key`,
+  `has_valid_keys`, `packets_received`) are serialized internally per
+  session, so every `he_expresslane_*` function is safe to call from any
+  thread on a shared handle (the only caller obligation is around
+  `he_expresslane_session_destroy`). Independent session handles never need
   coordination with each other.
 - **Panics**: caught at each `extern "C"` function boundary (reuse the
   pattern already used in `lightway-cffi`), mapped to

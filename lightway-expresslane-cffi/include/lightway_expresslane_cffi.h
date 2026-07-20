@@ -193,9 +193,10 @@ uint64_t he_expresslane_packets_sent(const he_expresslane_session_t *session);
  # Safety
  `session` must be a valid non-null pointer. `session_id` must point to 8
  readable bytes. `plain_text` must point to `plain_text_len` readable
- bytes. `iv` must point to 12 readable bytes. `out` must point to
- `out_capacity` writable bytes and must NOT overlap any of the input
- buffers. `out_len` must be a valid pointer to a `size_t`.
+ bytes (it may be NULL when `plain_text_len` is 0 — the conventional C
+ idiom for an empty payload). `iv` must point to 12 readable bytes. `out`
+ must point to `out_capacity` writable bytes and must NOT overlap any of
+ the input buffers. `out_len` must be a valid pointer to a `size_t`.
  */
 he_expresslane_return_code_t he_expresslane_encrypt(const he_expresslane_session_t *session,
                                                     uint64_t counter,
@@ -258,8 +259,10 @@ uint64_t he_expresslane_packets_received(const he_expresslane_session_t *session
  # Safety
  `session` must be a valid non-null pointer. `session_id` must point to 8
  readable bytes. `wire_packet` must point to `wire_packet_len` readable
- bytes. `out` must point to `out_capacity` writable bytes and must NOT
- overlap `wire_packet`. `out_len` and `is_encoded` must be valid pointers.
+ bytes. `out` must point to `out_capacity` writable bytes (it may be NULL
+ when `out_capacity` is 0, e.g. for a packet known to carry an empty
+ payload) and must NOT overlap `wire_packet`. `out_len` and `is_encoded`
+ must be valid pointers.
  */
 he_expresslane_return_code_t he_expresslane_decrypt(const he_expresslane_session_t *session,
                                                     const uint8_t *session_id,

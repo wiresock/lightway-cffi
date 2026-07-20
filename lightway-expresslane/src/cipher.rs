@@ -74,13 +74,15 @@ mod tests {
         let aad = b"aad";
 
         let mut buf = *b"secret payload!!";
-        let plaintext = buf;
         let tag = Cipher::new(&key_a).unwrap().encrypt(&iv, aad, &mut buf).unwrap();
+        let ciphertext = buf;
 
         let result = Cipher::new(&key_b).unwrap().decrypt(&iv, aad, &mut buf, &tag);
         assert_eq!(result, Err(ExpresslaneError::InvalidData));
-        // Buffer must be untouched on auth failure (still ciphertext, not plaintext).
-        assert_ne!(&buf[..], &plaintext[..]);
+        // Buffer must be byte-identical to the ciphertext on auth failure —
+        // not merely "not the plaintext", which would also pass if the
+        // failed decrypt had partially transformed it.
+        assert_eq!(buf, ciphertext);
     }
 
     #[test]

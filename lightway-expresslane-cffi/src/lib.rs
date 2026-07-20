@@ -189,9 +189,10 @@ pub unsafe extern "C" fn he_expresslane_packets_sent(
 /// # Safety
 /// `session` must be a valid non-null pointer. `session_id` must point to 8
 /// readable bytes. `plain_text` must point to `plain_text_len` readable
-/// bytes. `iv` must point to 12 readable bytes. `out` must point to
-/// `out_capacity` writable bytes and must NOT overlap any of the input
-/// buffers. `out_len` must be a valid pointer to a `size_t`.
+/// bytes (it may be NULL when `plain_text_len` is 0 — the conventional C
+/// idiom for an empty payload). `iv` must point to 12 readable bytes. `out`
+/// must point to `out_capacity` writable bytes and must NOT overlap any of
+/// the input buffers. `out_len` must be a valid pointer to a `size_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_encrypt(
     session: *const he_expresslane_session_t,
@@ -207,7 +208,7 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
 ) -> he_expresslane_return_code_t {
     if session.is_null()
         || session_id.is_null()
-        || plain_text.is_null()
+        || (plain_text.is_null() && plain_text_len > 0)
         || iv.is_null()
         || out.is_null()
         || out_len.is_null()
@@ -219,9 +220,15 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
         // this function's documented contract.
         let session_id_bytes: [u8; 8] =
             unsafe { std::slice::from_raw_parts(session_id, 8) }.try_into().unwrap();
-        // SAFETY: null checks above; plain_text is valid for plain_text_len
-        // bytes per this function's documented contract.
-        let plain_text_slice = unsafe { std::slice::from_raw_parts(plain_text, plain_text_len) };
+        let plain_text_slice: &[u8] = if plain_text_len == 0 {
+            // NULL is permitted for an empty payload; from_raw_parts requires
+            // a non-null pointer even for len 0, so use a literal empty slice.
+            &[]
+        } else {
+            // SAFETY: null/len checks above; plain_text is non-null and valid
+            // for plain_text_len bytes per this function's documented contract.
+            unsafe { std::slice::from_raw_parts(plain_text, plain_text_len) }
+        };
         // SAFETY: null checks above; iv is valid for 12 bytes per this
         // function's documented contract.
         let iv_bytes: [u8; 12] = unsafe { std::slice::from_raw_parts(iv, 12) }.try_into().unwrap();
@@ -338,8 +345,10 @@ pub unsafe extern "C" fn he_expresslane_packets_received(
 /// # Safety
 /// `session` must be a valid non-null pointer. `session_id` must point to 8
 /// readable bytes. `wire_packet` must point to `wire_packet_len` readable
-/// bytes. `out` must point to `out_capacity` writable bytes and must NOT
-/// overlap `wire_packet`. `out_len` and `is_encoded` must be valid pointers.
+/// bytes. `out` must point to `out_capacity` writable bytes (it may be NULL
+/// when `out_capacity` is 0, e.g. for a packet known to carry an empty
+/// payload) and must NOT overlap `wire_packet`. `out_len` and `is_encoded`
+/// must be valid pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_decrypt(
     session: *const he_expresslane_session_t,
@@ -354,7 +363,7 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
     if session.is_null()
         || session_id.is_null()
         || wire_packet.is_null()
-        || out.is_null()
+        || (out.is_null() && out_capacity > 0)
         || out_len.is_null()
         || is_encoded.is_null()
     {
@@ -368,9 +377,15 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
         // SAFETY: null checks above; wire_packet is valid for
         // wire_packet_len bytes per this function's documented contract.
         let wire_slice = unsafe { std::slice::from_raw_parts(wire_packet, wire_packet_len) };
-        // SAFETY: null checks above; out is valid and writable for
-        // out_capacity bytes per this function's documented contract.
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_capacity) };
+        let out_slice: &mut [u8] = if out_capacity == 0 {
+            // NULL is permitted for a zero-capacity output buffer;
+            // from_raw_parts_mut requires a non-null pointer even for len 0.
+            &mut []
+        } else {
+            // SAFETY: null/len checks above; out is non-null, writable for
+            // out_capacity bytes per this function's documented contract.
+            unsafe { std::slice::from_raw_parts_mut(out, out_capacity) }
+        };
 
         // SAFETY: null check above; session is valid for this call.
         let result = unsafe { &*session }.0.decrypt(session_id_bytes, wire_slice, out_slice);
@@ -656,6 +671,77 @@ mod tests {
             )
         };
         assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_KEY_NOT_SET);
+        unsafe { he_expresslane_session_destroy(receiver) };
+    }
+
+    #[test]
+    fn empty_payload_round_trips_with_null_buffers() {
+        // C convention: NULL + len 0 is a valid empty payload on encrypt, and
+        // NULL + capacity 0 a valid output buffer for it on decrypt.
+        let sender = unsafe { he_expresslane_session_create(2) };
+        let receiver = unsafe { he_expresslane_session_create(2) };
+        let key = [42u8; 32];
+        unsafe { he_expresslane_set_next_self_key(sender, key.as_ptr()) };
+        unsafe { he_expresslane_promote_self_key(sender) };
+        unsafe { he_expresslane_set_peer_key(receiver, key.as_ptr()) };
+
+        let session_id = [1u8; 8];
+        let iv = [7u8; 12];
+        let mut wire = vec![0u8; he_expresslane_wire_overhead()];
+        let mut wire_len: usize = 0;
+        let rc = unsafe {
+            he_expresslane_encrypt(
+                sender,
+                1,
+                session_id.as_ptr(),
+                std::ptr::null(), // empty payload
+                0,
+                iv.as_ptr(),
+                false,
+                wire.as_mut_ptr(),
+                wire.len(),
+                &mut wire_len,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS);
+        assert_eq!(wire_len, he_expresslane_wire_overhead());
+
+        let mut out_len: usize = 99;
+        let mut is_encoded = true;
+        let rc = unsafe {
+            he_expresslane_decrypt(
+                receiver,
+                session_id.as_ptr(),
+                wire.as_ptr(),
+                wire_len,
+                std::ptr::null_mut(), // zero-capacity output
+                0,
+                &mut out_len,
+                &mut is_encoded,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS);
+        assert_eq!(out_len, 0);
+        assert!(!is_encoded);
+
+        // NULL with a non-zero length is still rejected.
+        let rc = unsafe {
+            he_expresslane_encrypt(
+                sender,
+                2,
+                session_id.as_ptr(),
+                std::ptr::null(),
+                1,
+                iv.as_ptr(),
+                false,
+                wire.as_mut_ptr(),
+                wire.len(),
+                &mut wire_len,
+            )
+        };
+        assert_eq!(rc, he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER);
+
+        unsafe { he_expresslane_session_destroy(sender) };
         unsafe { he_expresslane_session_destroy(receiver) };
     }
 

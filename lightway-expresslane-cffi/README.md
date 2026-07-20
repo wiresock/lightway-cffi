@@ -26,9 +26,10 @@ full design.
   session): `he_expresslane_reserve_counter`, `he_expresslane_set_next_self_key`,
   `he_expresslane_promote_self_key`, `he_expresslane_packets_sent`,
   `he_expresslane_encrypt`.
-- **RX domain** (caller must externally serialize calls in this group on one
-  session): `he_expresslane_set_peer_key`, `he_expresslane_has_valid_keys`,
-  `he_expresslane_packets_received`, `he_expresslane_decrypt`.
+- **RX domain** (serialized internally per session — safe to call from any
+  thread; concurrent RX calls simply take turns): `he_expresslane_set_peer_key`,
+  `he_expresslane_has_valid_keys`, `he_expresslane_packets_received`,
+  `he_expresslane_decrypt`.
 - `he_expresslane_wire_overhead` — buffer sizing helper (40 bytes).
 
 All buffers are caller-owned: `he_expresslane_encrypt`/`he_expresslane_decrypt`

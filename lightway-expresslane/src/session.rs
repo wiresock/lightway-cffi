@@ -197,8 +197,8 @@ impl ExpresslaneSession {
         Ok(needed)
     }
 
-    // ---- RX domain: caller must externally serialize all calls in this
-    // group against the same session handle. ----
+    // ---- RX domain: serialized internally as a unit by `self.rx`; safe to
+    // call from any thread (concurrent RX calls simply take turns). ----
 
     /// Install a new peer (receive) key. The previous peer key becomes the
     /// fallback used by `decrypt` for packets still in flight from before

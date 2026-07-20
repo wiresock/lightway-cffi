@@ -35,7 +35,12 @@ fn main() {
             bindings.write_to_file(&out_header);
         }
         Err(e) => {
-            println!("cargo:warning=cbindgen failed to regenerate header: {e}");
+            // Fail the build rather than warn: a silently stale header would
+            // also slip past CI's "header unchanged after build" check (the
+            // file not regenerating means no diff). Environments that
+            // intentionally skip header generation set
+            // LIGHTWAY_CFFI_SKIP_CBINDGEN=1 above.
+            panic!("cbindgen failed to regenerate {}: {e}", out_header.display());
         }
     }
 }
