@@ -1378,6 +1378,20 @@ pub unsafe extern "C" fn he_conn_identify_packet(
     if kind.is_null() || (packet.is_null() && len > 0) {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
+    // Default every out-param before the fallible body, so any return (incl. a
+    // panic mapped to HE_ERR_FAILED, or the UNDECIDABLE arm) leaves safe values
+    // rather than the caller's prior/uninitialised stack contents.
+    // SAFETY: kind is non-null (checked); session_id/header_len are written
+    // only when non-null, per the documented contract.
+    unsafe {
+        *kind = he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE;
+        if !session_id.is_null() {
+            std::ptr::write_bytes(session_id, 0, 8);
+        }
+        if !header_len.is_null() {
+            *header_len = 0;
+        }
+    }
     ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
         // Only the header window is needed; copy it into a BytesMut for the
         // parser. A datagram shorter than the header simply fails to parse.
@@ -1387,23 +1401,22 @@ pub unsafe extern "C" fn he_conn_identify_packet(
             // SAFETY: packet is valid for `len` (>= n) readable bytes when len > 0.
             buf.extend_from_slice(unsafe { std::slice::from_raw_parts(packet, n) });
         }
-        let (k, sid) = match Header::try_from_wire(&mut buf) {
-            Ok(hdr) => {
-                let k = if hdr.expresslane_data {
+        // A frame that fails to parse keeps the Undecidable / zero defaults
+        // written above.
+        if let Ok(hdr) = Header::try_from_wire(&mut buf) {
+            // SAFETY: kind is non-null (checked above).
+            unsafe {
+                *kind = if hdr.expresslane_data {
                     he_packet_kind_t::HE_PACKET_KIND_EXPRESSLANE
                 } else {
                     he_packet_kind_t::HE_PACKET_KIND_CONTROL
                 };
-                (k, Some(*hdr.session.as_bytes()))
             }
-            Err(_) => (he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE, None),
-        };
-        // SAFETY: kind is non-null (checked above).
-        unsafe { *kind = k };
-        if let Some(sid) = sid {
             if !session_id.is_null() {
                 // SAFETY: caller guarantees session_id is writable for 8 bytes.
-                unsafe { std::ptr::copy_nonoverlapping(sid.as_ptr(), session_id, 8) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(hdr.session.as_bytes().as_ptr(), session_id, 8)
+                };
             }
             if !header_len.is_null() {
                 // SAFETY: caller guarantees header_len is writable.
@@ -1416,16 +1429,24 @@ pub unsafe extern "C" fn he_conn_identify_packet(
 
 /// Build the 16-byte cleartext lightway wire header to prepend to an
 /// ExpressLane data datagram produced by `he_expresslane_encrypt`, using the
-/// connection's negotiated protocol version and current session id — the
-/// authoritative source, so offload egress framing matches what `lightway-core`
-/// emits for control traffic on the same flow. The `expresslane_data` flag is
-/// set and `aggressive_mode` is cleared.
+/// connection's protocol version and current session id. For a client
+/// connection (the only kind this shim builds) these match what `lightway-core`
+/// stamps on control traffic over the same flow, so offloaded ExpressLane
+/// datagrams frame identically. The `expresslane_data` flag is set and
+/// `aggressive_mode` is cleared.
 ///
-/// The session id / version change rarely (only at handshake / session
-/// rotation), so callers should cache the result and rebuild it on a
-/// state-change or when `he_conn_get_session_id` changes.
+/// A session id is only assigned once the handshake completes, so this returns
+/// `HE_ERR_INVALID_CONN_STATE` until then (rather than emitting a header with
+/// the reserved all-zero session that the peer would drop). The session id /
+/// version change rarely (only at handshake / session rotation), so callers
+/// should cache the result and rebuild it on a state change or when
+/// `he_conn_get_session_id` changes.
 ///
-/// Returns `HE_ERR_INVALID_CONN_STATE` if no connection is active yet.
+/// Returns:
+/// - `HE_ERR_NULL_POINTER` if `out` is null.
+/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, if the session
+///   is not yet established, or if called re-entrantly from within a callback
+///   that already holds the per-client lock.
 ///
 /// # Safety
 /// `client` must be null or a valid pointer from `he_client_create`. `out`
@@ -1446,24 +1467,32 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
                 let Some(ref conn) = client.connection else {
                     return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                 };
+                let session = conn.session_id();
+                // Before the handshake assigns a session, session_id() is the
+                // reserved all-zero EMPTY value; a header carrying it is
+                // unroutable, so report "not ready" instead of success.
+                if session.is_reserved() {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                }
                 let hdr = Header {
+                    // For a client, tunnel_protocol_version is fixed at connect
+                    // and equals the version lightway-core stamps on egress.
                     version: conn.tunnel_protocol_version(),
                     aggressive_mode: false,
                     expresslane_data: true,
-                    session: conn.session_id(),
+                    session,
                 };
                 let mut bm = BytesMut::with_capacity(Header::WIRE_SIZE);
                 hdr.append_to_wire(&mut bm);
-                let mut bytes = [0u8; Header::WIRE_SIZE];
-                bytes.copy_from_slice(&bm[..Header::WIRE_SIZE]);
-                Ok(bytes)
+                Ok(bm)
             })
         };
         match result {
-            Ok(Ok(bytes)) => {
+            Ok(Ok(bm)) => {
                 // SAFETY: out is non-null (checked) and writable for 16 bytes
-                // per the documented contract; bytes is a distinct local.
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, Header::WIRE_SIZE) };
+                // per the documented contract; append_to_wire wrote exactly
+                // WIRE_SIZE bytes into the distinct `bm` buffer.
+                unsafe { std::ptr::copy_nonoverlapping(bm.as_ptr(), out, Header::WIRE_SIZE) };
                 he_return_code_t::HE_SUCCESS
             }
             Ok(Err(code)) | Err(code) => code,
@@ -1971,15 +2000,20 @@ mod tests {
 
     #[test]
     fn identify_packet_rejects_bad_magic_short_and_null() {
-        // Bad magic → Undecidable, still HE_SUCCESS.
+        // Bad magic → Undecidable, still HE_SUCCESS; out-params defaulted even
+        // though they carried non-default junk before the call.
         let bad = [0u8; 20];
         let mut kind = he_packet_kind_t::HE_PACKET_KIND_CONTROL;
-        // SAFETY: valid buffer, null optional out-params allowed.
+        let mut sid = [0xAAu8; 8];
+        let mut hlen = 999usize;
+        // SAFETY: valid buffer + out-params.
         let rc = unsafe {
-            he_conn_identify_packet(bad.as_ptr(), bad.len(), &mut kind, std::ptr::null_mut(), std::ptr::null_mut())
+            he_conn_identify_packet(bad.as_ptr(), bad.len(), &mut kind, sid.as_mut_ptr(), &mut hlen)
         };
         assert_eq!(rc, he_return_code_t::HE_SUCCESS);
         assert_eq!(kind, he_packet_kind_t::HE_PACKET_KIND_UNDECIDABLE);
+        assert_eq!(sid, [0u8; 8], "session_id defaulted to zero on undecidable");
+        assert_eq!(hlen, 0, "header_len defaulted to zero on undecidable");
 
         // Shorter than the 16-byte header → Undecidable.
         let short = *b"He\x01\x03\x00\x01";
