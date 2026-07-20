@@ -30,12 +30,15 @@ pub struct he_expresslane_session_t(ExpresslaneSession);
 
 /// Allocate a new ExpressLane session for the given wire version.
 ///
-/// `version` is a raw byte (0 = unknown, 1 = V1, 2 = V2 — see
-/// `he_expresslane_version_t`) rather than the enum type directly, so an
-/// out-of-range value from C falls back to `HE_EXPRESSLANE_VERSION_UNKNOWN`
-/// instead of being reinterpreted as an invalid discriminant.
+/// `version` is a raw byte (1 = V1, 2 = V2 — see `he_expresslane_version_t`).
+/// The version selects the AEAD AAD layout (V2 binds the flags field, V1 does
+/// not), so an unrecognized value — including 0
+/// (`HE_EXPRESSLANE_VERSION_UNKNOWN`) — returns **NULL** rather than silently
+/// running in V1 mode, which against a peer that negotiated the other version
+/// would make every packet fail authentication with no distinguishing error.
 ///
-/// Returns a heap-allocated pointer. The caller must free it with
+/// Returns a heap-allocated pointer, or NULL for an unrecognized version /
+/// allocation failure. The caller must free a non-NULL result with
 /// `he_expresslane_session_destroy`.
 ///
 /// # Safety
@@ -45,9 +48,14 @@ pub unsafe extern "C" fn he_expresslane_session_create(
     version: u8,
 ) -> *mut he_expresslane_session_t {
     let version = ExpresslaneVersion::from(version);
-    Box::into_raw(Box::new(he_expresslane_session_t(ExpresslaneSession::new(
-        version,
-    ))))
+    if version == ExpresslaneVersion::Unknown {
+        return std::ptr::null_mut();
+    }
+    ffi_guard(std::ptr::null_mut(), || {
+        Box::into_raw(Box::new(he_expresslane_session_t(ExpresslaneSession::new(
+            version,
+        ))))
+    })
 }
 
 /// Free a session previously allocated by `he_expresslane_session_create`.
@@ -60,11 +68,14 @@ pub unsafe extern "C" fn he_expresslane_session_create(
 /// destruction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_session_destroy(session: *mut he_expresslane_session_t) {
-    if !session.is_null() {
-        // SAFETY: pointer was created by Box::into_raw in
-        // he_expresslane_session_create.
-        unsafe { drop(Box::from_raw(session)) };
+    if session.is_null() {
+        return;
     }
+    ffi_guard((), || {
+        // SAFETY: pointer was created by Box::into_raw in
+        // he_expresslane_session_create and is not used after this call.
+        unsafe { drop(Box::from_raw(session)) };
+    });
 }
 
 use lightway_expresslane::{EXPRESSLANE_KEY_SIZE, ExpresslaneKey};
@@ -83,8 +94,10 @@ pub unsafe extern "C" fn he_expresslane_reserve_counter(
     if session.is_null() {
         return 0;
     }
-    // SAFETY: null check above; session is valid for this call.
-    unsafe { &*session }.0.reserve_counter()
+    ffi_guard(0, || {
+        // SAFETY: null check above; session is valid for this call.
+        unsafe { &*session }.0.reserve_counter()
+    })
 }
 
 /// Stage a new "next self" key. Call `he_expresslane_promote_self_key` once
@@ -134,8 +147,10 @@ pub unsafe extern "C" fn he_expresslane_promote_self_key(
     if session.is_null() {
         return;
     }
-    // SAFETY: null check above; session is valid for this call.
-    unsafe { &*session }.0.promote_self_key();
+    ffi_guard((), || {
+        // SAFETY: null check above; session is valid for this call.
+        unsafe { &*session }.0.promote_self_key();
+    });
 }
 
 /// Total number of packets successfully encrypted so far on this session.
@@ -149,8 +164,10 @@ pub unsafe extern "C" fn he_expresslane_packets_sent(
     if session.is_null() {
         return 0;
     }
-    // SAFETY: null check above; session is valid for this call.
-    unsafe { &*session }.0.packets_sent()
+    ffi_guard(0, || {
+        // SAFETY: null check above; session is valid for this call.
+        unsafe { &*session }.0.packets_sent()
+    })
 }
 
 /// Encrypt `plain_text` into ExpressLane wire format. Safe to call
@@ -161,12 +178,20 @@ pub unsafe extern "C" fn he_expresslane_packets_sent(
 /// `he_expresslane_wire_overhead() + plain_text_len` bytes. On success,
 /// `*out_len` is set to the number of bytes written to `out`.
 ///
+/// # IV / nonce uniqueness (SECURITY-CRITICAL)
+/// `iv` is the AES-GCM nonce. The caller MUST supply a fresh, unpredictable
+/// 12-byte `iv` for every packet encrypted under a given key. Reusing a
+/// `(key, iv)` pair is catastrophic for AES-GCM — it leaks the XOR of the
+/// plaintexts and enables forgery of arbitrary packets. The `counter` is
+/// authenticated but is NOT the nonce; a unique `counter` does not make the
+/// `iv` unique. This library has no RNG and cannot enforce this.
+///
 /// # Safety
 /// `session` must be a valid non-null pointer. `session_id` must point to 8
 /// readable bytes. `plain_text` must point to `plain_text_len` readable
 /// bytes. `iv` must point to 12 readable bytes. `out` must point to
-/// `out_capacity` writable bytes. `out_len` must be a valid pointer to a
-/// `size_t`.
+/// `out_capacity` writable bytes and must NOT overlap any of the input
+/// buffers. `out_len` must be a valid pointer to a `size_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_encrypt(
     session: *const he_expresslane_session_t,
@@ -227,16 +252,20 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
 
 /// Install a new peer (receive) key. The previous peer key becomes the
 /// fallback used by `he_expresslane_decrypt` for packets still in flight
-/// from before the peer's rotation. Caller must externally serialize this
-/// call against `he_expresslane_decrypt`/`he_expresslane_has_valid_keys`/
-/// `he_expresslane_packets_received` on the same session.
+/// from before the peer's rotation. Returns
+/// `HE_EXPRESSLANE_ERR_INVALID_KEY` for an all-zero key.
+///
+/// The receive-side calls (`he_expresslane_decrypt`, this function,
+/// `he_expresslane_has_valid_keys`, `he_expresslane_packets_received`) are
+/// serialized internally per session, so this is safe to call from any
+/// thread; concurrent RX calls simply take turns.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer. `key` must point to 32
 /// readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_set_peer_key(
-    session: *mut he_expresslane_session_t,
+    session: *const he_expresslane_session_t,
     key: *const u8,
 ) -> he_expresslane_return_code_t {
     if session.is_null() || key.is_null() {
@@ -250,7 +279,7 @@ pub unsafe extern "C" fn he_expresslane_set_peer_key(
                 .try_into()
                 .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
         // SAFETY: null check above; session is valid for this call.
-        match unsafe { &mut *session }
+        match unsafe { &*session }
             .0
             .update_peer_key(ExpresslaneKey::from(key_bytes))
         {
@@ -261,56 +290,59 @@ pub unsafe extern "C" fn he_expresslane_set_peer_key(
 }
 
 /// True if both a self (send) key and a peer (receive) key are installed.
-/// Caller must externally serialize this call against
-/// `he_expresslane_decrypt`/`he_expresslane_set_peer_key` on the same
-/// session.
+/// Serialized internally with the other receive-side calls, so safe to call
+/// from any thread.
 ///
 /// # Safety
-/// `session` must be a valid non-null pointer.
+/// `session` must be a valid non-null pointer or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_has_valid_keys(
-    session: *mut he_expresslane_session_t,
+    session: *const he_expresslane_session_t,
 ) -> bool {
     if session.is_null() {
         return false;
     }
-    // SAFETY: null check above; session is valid for this call.
-    unsafe { &mut *session }.0.has_valid_keys()
+    ffi_guard(false, || {
+        // SAFETY: null check above; session is valid for this call.
+        unsafe { &*session }.0.has_valid_keys()
+    })
 }
 
 /// Total number of packets successfully decrypted so far on this session.
-/// Caller must externally serialize this call against
-/// `he_expresslane_decrypt` on the same session.
+/// Serialized internally with the other receive-side calls, so safe to call
+/// from any thread.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_packets_received(
-    session: *mut he_expresslane_session_t,
+    session: *const he_expresslane_session_t,
 ) -> u64 {
     if session.is_null() {
         return 0;
     }
-    // SAFETY: null check above; session is valid for this call.
-    unsafe { &mut *session }.0.packets_received()
+    ffi_guard(0, || {
+        // SAFETY: null check above; session is valid for this call.
+        unsafe { &*session }.0.packets_received()
+    })
 }
 
 /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out` must
 /// have capacity for at least `wire_packet_len - he_expresslane_wire_overhead()`
 /// bytes. On success, `*out_len` is set to the plaintext length and
-/// `*is_encoded` to the packet's encoded flag. Caller must externally
-/// serialize this call against `he_expresslane_set_peer_key`/
-/// `he_expresslane_has_valid_keys`/`he_expresslane_packets_received` on the
-/// same session — no internal locking.
+/// `*is_encoded` to the packet's encoded flag. The receive-side calls
+/// (`he_expresslane_set_peer_key`, `he_expresslane_has_valid_keys`,
+/// `he_expresslane_packets_received` and this one) are serialized internally
+/// per session, so this is safe to call from any thread.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer. `session_id` must point to 8
 /// readable bytes. `wire_packet` must point to `wire_packet_len` readable
-/// bytes. `out` must point to `out_capacity` writable bytes. `out_len` and
-/// `is_encoded` must be valid pointers.
+/// bytes. `out` must point to `out_capacity` writable bytes and must NOT
+/// overlap `wire_packet`. `out_len` and `is_encoded` must be valid pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_decrypt(
-    session: *mut he_expresslane_session_t,
+    session: *const he_expresslane_session_t,
     session_id: *const u8,
     wire_packet: *const u8,
     wire_packet_len: usize,
@@ -341,7 +373,7 @@ pub unsafe extern "C" fn he_expresslane_decrypt(
         let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_capacity) };
 
         // SAFETY: null check above; session is valid for this call.
-        let result = unsafe { &mut *session }.0.decrypt(session_id_bytes, wire_slice, out_slice);
+        let result = unsafe { &*session }.0.decrypt(session_id_bytes, wire_slice, out_slice);
         match result {
             Ok((len, encoded)) => {
                 // SAFETY: null checks above; out_len/is_encoded are valid
@@ -368,6 +400,10 @@ pub extern "C" fn he_expresslane_wire_overhead() -> usize {
 }
 
 #[cfg(test)]
+// Test bodies are dense with FFI calls; a `// SAFETY:` on each `unsafe` block
+// would be pure noise. The invariants are the same ones the function docs
+// state and the non-test callers must uphold.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
 
@@ -384,10 +420,11 @@ mod tests {
     }
 
     #[test]
-    fn create_with_unknown_version_byte_falls_back_safely() {
-        let session = unsafe { he_expresslane_session_create(255) };
-        assert!(!session.is_null());
-        unsafe { he_expresslane_session_destroy(session) };
+    fn create_with_unknown_version_byte_returns_null() {
+        // An unrecognized version selects no AAD layout, so it is rejected
+        // rather than silently running in V1 mode.
+        assert!(unsafe { he_expresslane_session_create(255) }.is_null());
+        assert!(unsafe { he_expresslane_session_create(0) }.is_null());
     }
 
     #[test]

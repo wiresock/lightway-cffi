@@ -44,6 +44,9 @@ impl ExpresslaneCb<CffiAppState> for CffiExpresslaneCb {
             session_id: session_id_bytes,
             self_key: data.self_key.0,
             peer_key: data.peer_key.0,
+            // Wire byte of the negotiated version (repr(u8): Unknown=0/V1=1/V2=2)
+            // so the consumer can create a matching he_expresslane_session_t.
+            version: data.version as u8,
         };
 
         // SAFETY: conn_ptr and ctx are valid for connection lifetime.

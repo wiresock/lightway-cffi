@@ -4,7 +4,11 @@
 pub const EXPRESSLANE_KEY_SIZE: usize = 32;
 
 /// An ExpressLane AES-256-GCM key.
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
+///
+/// `Debug` is deliberately redacted so key material never lands in logs; the
+/// expanded key schedule held by the loaded [`crate::cipher::Cipher`] is
+/// zeroized on drop via `aes-gcm`'s `zeroize` feature.
+#[derive(PartialEq, Eq, Clone, Copy, Default)]
 pub struct ExpresslaneKey(pub [u8; EXPRESSLANE_KEY_SIZE]);
 
 impl ExpresslaneKey {
@@ -14,6 +18,17 @@ impl ExpresslaneKey {
     /// Returns true if this key is the all-zero `INVALID` sentinel.
     pub fn is_invalid(&self) -> bool {
         *self == Self::INVALID
+    }
+}
+
+impl std::fmt::Debug for ExpresslaneKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key bytes; distinguish only the all-zero sentinel.
+        if self.is_invalid() {
+            f.write_str("ExpresslaneKey(INVALID)")
+        } else {
+            f.write_str("ExpresslaneKey(<redacted>)")
+        }
     }
 }
 

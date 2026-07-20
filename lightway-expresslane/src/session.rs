@@ -10,19 +10,26 @@ use crate::key::ExpresslaneKey;
 use crate::replay_window::ReplayWindow;
 use crate::version::ExpresslaneVersion;
 
+/// The `is_encoded` bit within the 16-bit wire flags field.
+const FLAG_ENCODED: u16 = 0x8000;
+
 /// Build the AEAD associated data for an ExpressLane data packet.
 /// Returns a fixed-size buffer and the number of significant bytes.
+///
+/// For `Version2` the **full** 16-bit `flags` field — including the 15
+/// reserved bits — is bound into the AAD, exactly as `lightway-core` does, so
+/// that flipping any flags bit on the wire fails authentication. For
+/// `Version1` (and `Unknown`) the flags are not part of the AAD.
 fn build_aad(
     version: ExpresslaneVersion,
     session_id: [u8; 8],
     counter: u64,
-    encoded: bool,
+    flags: u16,
 ) -> ([u8; 18], usize) {
     let mut buf = [0u8; 18];
     buf[..8].copy_from_slice(&session_id);
     buf[8..16].copy_from_slice(&counter.to_be_bytes());
     if version >= ExpresslaneVersion::Version2 {
-        let flags: u16 = if encoded { 0x8000 } else { 0 };
         buf[16..].copy_from_slice(&flags.to_be_bytes());
         (buf, 18)
     } else {
@@ -33,24 +40,37 @@ fn build_aad(
 /// An ExpressLane packet-crypto session: key rotation state, replay
 /// window, and encrypt/decrypt.
 ///
-/// Splits into two independently-synchronized halves — see
+/// Every method takes `&self` and the session is `Sync`, so all methods are
+/// safe to call from any thread on a shared handle — see
 /// `docs/superpowers/specs/2026-07-16-expresslane-data-cffi-design.md`'s
-/// "Parallel encrypt" section in the `lightway-cffi` repo for the full
-/// rationale:
+/// "Parallel encrypt" section in the `lightway-cffi` repo for the rationale:
 ///
-/// - TX state (`current_self`, `next_self`, counters): safe to call
-///   concurrently from multiple threads on the same session.
-/// - RX state (`current_peer`, `prev_peer`, `replay_window`): exclusive
-///   access only — callers must externally serialize `decrypt`,
-///   `update_peer_key`, `has_valid_keys`, `packets_received`.
+/// - TX state (`current_self`, `next_self`, counters) is lock-free / read-lock
+///   only, so many threads `encrypt()` concurrently at full throughput.
+/// - RX state (`current_peer`, `prev_peer`, `replay_window`) is serialized as
+///   a unit behind `rx`. The replay-window bitmap update is inherently
+///   ordered and a single RX thread per session is the common case, so this
+///   lock is uncontended by design; it exists so a stray concurrent RX call
+///   is merely serialized rather than undefined behavior.
+///
+/// (The `rx` mutex is `std::sync::Mutex` for now; a future `no_std`/kernel
+/// port would swap it for a `no_std` mutex — see the design doc's "Forward
+/// compatibility" section.)
 pub struct ExpresslaneSession {
     version: ExpresslaneVersion,
 
+    // TX state — concurrent-safe.
     current_self: RwLock<Option<Cipher>>,
     next_self: Mutex<Option<Cipher>>,
     next_counter: AtomicU64,
     packets_sent: AtomicU64,
 
+    // RX state — serialized as a unit by this mutex.
+    rx: Mutex<RxState>,
+}
+
+/// Receive-side session state, serialized as a unit by `ExpresslaneSession::rx`.
+struct RxState {
     current_peer: Option<Cipher>,
     prev_peer: Option<Cipher>,
     replay_window: ReplayWindow,
@@ -69,9 +89,11 @@ impl ExpresslaneSession {
             next_self: Mutex::new(None),
             next_counter: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
-            current_peer: None,
-            prev_peer: None,
-            replay_window: ReplayWindow::default(),
+            rx: Mutex::new(RxState {
+                current_peer: None,
+                prev_peer: None,
+                replay_window: ReplayWindow::default(),
+            }),
         }
     }
 
@@ -84,12 +106,23 @@ impl ExpresslaneSession {
     /// session.
     pub fn reserve_counter(&self) -> u64 {
         // Matches upstream lightway-core: first packet is counter 1, not 0.
-        self.next_counter.fetch_add(1, Ordering::Relaxed) + 1
+        // `wrapping_add` avoids a debug-build overflow panic at u64::MAX; the
+        // release-mode wrap (MAX, 0, 1) matches lightway-core's
+        // `wire_counter.wrapping_add(1)` sequence.
+        self.next_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
     /// Stage a new "next self" key. Call `promote_self_key` once the peer
     /// has acknowledged the rotation to make it the active send key.
+    ///
+    /// Returns [`ExpresslaneError::InvalidKey`] for the all-zero
+    /// [`ExpresslaneKey::INVALID`] sentinel, which the upstream key-delivery
+    /// callback can emit before the self key has been promoted; installing it
+    /// would encrypt under a publicly-known key.
     pub fn update_next_self_key(&self, key: ExpresslaneKey) -> ExpresslaneResult<()> {
+        if key.is_invalid() {
+            return Err(ExpresslaneError::InvalidKey);
+        }
         let cipher = Cipher::new(&key)?;
         *self.next_self.lock().unwrap_or_else(|e| e.into_inner()) = Some(cipher);
         Ok(())
@@ -114,6 +147,17 @@ impl ExpresslaneSession {
     /// `WIRE_OVERHEAD + plain_text.len()` bytes. `counter` must be unique
     /// for this session — see `reserve_counter`. Returns the number of
     /// bytes written to `out`.
+    ///
+    /// # IV / nonce uniqueness (security-critical)
+    ///
+    /// `iv` is the AES-GCM nonce. The caller MUST supply a fresh,
+    /// unpredictable 12-byte `iv` for every packet encrypted under a given
+    /// key. Reusing a `(key, iv)` pair is catastrophic for AES-GCM: it leaks
+    /// the XOR of the two plaintexts and allows recovery of the GHASH
+    /// authentication key, i.e. arbitrary packet forgery. The wire `counter`
+    /// is authenticated via the AAD but is NOT the nonce and does not by
+    /// itself guarantee nonce uniqueness. This crate has no RNG and cannot
+    /// enforce this.
     pub fn encrypt(
         &self,
         counter: u64,
@@ -134,7 +178,10 @@ impl ExpresslaneSession {
         let guard = self.current_self.read().unwrap_or_else(|e| e.into_inner());
         let cipher = guard.as_ref().ok_or(ExpresslaneError::KeyNotSet)?;
 
-        let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, is_encoded);
+        // Reserved flag bits are always zero on send; the full 16-bit field is
+        // bound into the V2 AAD (see `build_aad`) and written to the wire.
+        let flags: u16 = if is_encoded { FLAG_ENCODED } else { 0 };
+        let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, flags);
 
         out[8..20].copy_from_slice(&iv);
         out[40..needed].copy_from_slice(plain_text);
@@ -144,7 +191,6 @@ impl ExpresslaneSession {
         out[0..8].copy_from_slice(&counter.to_be_bytes());
         out[20..36].copy_from_slice(&tag);
         out[36..38].copy_from_slice(&(plain_text.len() as u16).to_be_bytes());
-        let flags: u16 = if is_encoded { 0x8000 } else { 0 };
         out[38..40].copy_from_slice(&flags.to_be_bytes());
 
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -157,16 +203,29 @@ impl ExpresslaneSession {
     /// Install a new peer (receive) key. The previous peer key becomes the
     /// fallback used by `decrypt` for packets still in flight from before
     /// the peer's rotation.
-    pub fn update_peer_key(&mut self, key: ExpresslaneKey) -> ExpresslaneResult<()> {
+    ///
+    /// Returns [`ExpresslaneError::InvalidKey`] for the all-zero
+    /// [`ExpresslaneKey::INVALID`] sentinel.
+    pub fn update_peer_key(&self, key: ExpresslaneKey) -> ExpresslaneResult<()> {
+        if key.is_invalid() {
+            return Err(ExpresslaneError::InvalidKey);
+        }
         let cipher = Cipher::new(&key)?;
-        self.prev_peer = self.current_peer.replace(cipher);
+        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        rx.prev_peer = rx.current_peer.replace(cipher);
         Ok(())
     }
 
     /// True if both a self (send) key and a peer (receive) key are
     /// installed.
-    pub fn has_valid_keys(&mut self) -> bool {
-        self.current_peer.is_some()
+    pub fn has_valid_keys(&self) -> bool {
+        let has_peer = self
+            .rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_peer
+            .is_some();
+        has_peer
             && self
                 .current_self
                 .read()
@@ -175,15 +234,19 @@ impl ExpresslaneSession {
     }
 
     /// Total number of packets successfully decrypted so far.
-    pub fn packets_received(&mut self) -> u64 {
-        self.replay_window.packets_received()
+    pub fn packets_received(&self) -> u64 {
+        self.rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay_window
+            .packets_received()
     }
 
     /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out`
     /// must have capacity for at least `wire_packet.len() - WIRE_OVERHEAD`
     /// bytes. Returns `(plaintext_len, is_encoded)`.
     pub fn decrypt(
-        &mut self,
+        &self,
         session_id: [u8; 8],
         wire_packet: &[u8],
         out: &mut [u8],
@@ -193,16 +256,11 @@ impl ExpresslaneSession {
         }
 
         let counter = u64::from_be_bytes(wire_packet[0..8].try_into().unwrap());
-
-        if self.replay_window.would_reject(counter) {
-            return Err(ExpresslaneError::Replayed);
-        }
-
         let iv: [u8; 12] = wire_packet[8..20].try_into().unwrap();
         let tag: [u8; 16] = wire_packet[20..36].try_into().unwrap();
         let data_len = u16::from_be_bytes(wire_packet[36..38].try_into().unwrap()) as usize;
         let flags = u16::from_be_bytes(wire_packet[38..40].try_into().unwrap());
-        let is_encoded = flags & 0x8000 != 0;
+        let is_encoded = flags & FLAG_ENCODED != 0;
 
         if wire_packet.len() < Self::WIRE_OVERHEAD + data_len {
             return Err(ExpresslaneError::InsufficientData);
@@ -211,20 +269,42 @@ impl ExpresslaneSession {
             return Err(ExpresslaneError::BufferTooSmall);
         }
 
-        let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, is_encoded);
-        out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
+        // Bind the full received flags into the AAD (V2), matching
+        // lightway-core: any modified flag bit — including reserved bits —
+        // fails authentication.
+        let (aad_buf, aad_len) = build_aad(self.version, session_id, counter, flags);
 
-        let current = self.current_peer.as_ref().ok_or(ExpresslaneError::KeyNotSet)?;
-        if current.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag).is_err() {
-            match self.prev_peer.as_ref() {
-                Some(prev) => {
-                    prev.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)?;
-                }
-                None => return Err(ExpresslaneError::InvalidData),
-            }
+        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Non-mutating replay pre-check before paying the AEAD cost.
+        if rx.replay_window.would_reject(counter) {
+            return Err(ExpresslaneError::Replayed);
         }
 
-        if !self.replay_window.commit(counter) {
+        out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
+
+        // Try the current peer key, then the previous one (rotation
+        // fallback). On authentication failure the cipher leaves `out`
+        // unchanged, so the fallback attempt sees the original ciphertext.
+        let decrypted = {
+            let Some(current) = rx.current_peer.as_ref() else {
+                return Err(ExpresslaneError::KeyNotSet);
+            };
+            current
+                .decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
+                .is_ok()
+                || rx.prev_peer.as_ref().is_some_and(|prev| {
+                    prev.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
+                        .is_ok()
+                })
+        };
+        if !decrypted {
+            return Err(ExpresslaneError::InvalidData);
+        }
+
+        // Commit only after successful authentication, so a forged packet
+        // cannot poison the replay window.
+        if !rx.replay_window.commit(counter) {
             return Err(ExpresslaneError::Replayed);
         }
 
@@ -352,7 +432,7 @@ mod tests {
     #[test]
     fn round_trip_encryption_decryption() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -376,7 +456,7 @@ mod tests {
     #[test]
     fn round_trip_with_encoded_flag() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -397,7 +477,7 @@ mod tests {
 
     #[test]
     fn decrypt_without_key_returns_key_not_set() {
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
         let wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD];
         let mut out = vec![0u8; 4];
         let result = receiver.decrypt([1u8; 8], &wire, &mut out);
@@ -406,7 +486,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_insufficient_data() {
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
         let wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD - 1];
         let mut out = vec![0u8; 4];
         let result = receiver.decrypt([1u8; 8], &wire, &mut out);
@@ -416,7 +496,7 @@ mod tests {
     #[test]
     fn decrypt_rejects_replay() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -438,7 +518,7 @@ mod tests {
     #[test]
     fn decrypt_falls_back_to_prev_peer_key_during_rotation() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let old_key = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
         let new_key = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
@@ -464,7 +544,7 @@ mod tests {
     #[test]
     fn cross_version_v1_to_v2_fails() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version1);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -487,7 +567,7 @@ mod tests {
         // On-path attacker flips the encoded flag. AEAD must reject V2
         // packets because the flags field is bound into the auth tag.
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -511,7 +591,7 @@ mod tests {
     #[test]
     fn forged_packet_does_not_poison_replay_window() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
-        let mut receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
 
         let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
         sender.update_next_self_key(key).unwrap();
@@ -550,7 +630,7 @@ mod tests {
 
     #[test]
     fn has_valid_keys_requires_both_self_and_peer() {
-        let mut session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
         assert!(!session.has_valid_keys());
 
         session.update_next_self_key(ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE])).unwrap();
@@ -607,7 +687,7 @@ mod tests {
         counters.dedup();
         assert_eq!(counters.len(), THREADS * PER_THREAD, "counters must all be unique");
 
-        let mut rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
         rx.update_peer_key(key).unwrap();
         for packet in &packets {
             let mut out = vec![0u8; packet.len() - ExpresslaneSession::WIRE_OVERHEAD];
@@ -656,7 +736,7 @@ mod tests {
 
         // Every produced packet must decrypt with one of the two known
         // keys - none corrupted by the concurrent rotation.
-        let mut rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let rx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
         rx.update_peer_key(key_a).unwrap();
         rx.update_peer_key(key_b).unwrap(); // key_b current, key_a prev - both tried
         for packet in &packets {
@@ -664,5 +744,137 @@ mod tests {
             rx.decrypt(session_id, packet, &mut out)
                 .unwrap_or_else(|e| panic!("packet failed to decrypt: {e}"));
         }
+    }
+
+    #[test]
+    fn v1_round_trip_without_flags_in_aad() {
+        // V1 sender <-> V1 receiver: flags are not part of the AAD, so a
+        // clear-flag packet round-trips. Guards the V1 positive path, which
+        // the V2-only tests above don't cover.
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version1);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version1);
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"v1 payload";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        let mut out = vec![0u8; plain_text.len()];
+        let (len, is_encoded) = receiver.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], plain_text);
+        assert!(!is_encoded);
+    }
+
+    #[test]
+    fn v2_reserved_flag_bit_tamper_is_rejected() {
+        // A reserved (non-encoded) flag bit is bound into the V2 AAD, so
+        // flipping one must fail authentication - matching lightway-core.
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let plain_text = b"reserved bit test";
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, plain_text, [0u8; 12], false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        // Flip a reserved flag bit (LSB of the flags field at wire byte 39).
+        assert_eq!(wire[39] & 0x01, 0, "precondition: reserved bit clear");
+        wire[39] |= 0x01;
+
+        let mut out = vec![0u8; plain_text.len()];
+        assert_eq!(
+            receiver.decrypt(session_id, &wire, &mut out),
+            Err(ExpresslaneError::InvalidData)
+        );
+    }
+
+    #[test]
+    fn decrypt_rejects_data_len_exceeding_packet() {
+        // A data_len field claiming more bytes than the packet carries must be
+        // rejected before any AEAD work (bounds the ciphertext slice).
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        receiver.update_peer_key(ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE])).unwrap();
+
+        // Overhead-only frame, but data_len claims 100 bytes of payload.
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD];
+        wire[36..38].copy_from_slice(&100u16.to_be_bytes());
+
+        let mut out = vec![0u8; 100];
+        assert_eq!(
+            receiver.decrypt([1u8; 8], &wire, &mut out),
+            Err(ExpresslaneError::InsufficientData)
+        );
+    }
+
+    #[test]
+    fn update_key_rejects_all_zero_invalid_sentinel() {
+        let session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        assert_eq!(
+            session.update_next_self_key(ExpresslaneKey::INVALID),
+            Err(ExpresslaneError::InvalidKey)
+        );
+        assert_eq!(
+            session.update_peer_key(ExpresslaneKey::INVALID),
+            Err(ExpresslaneError::InvalidKey)
+        );
+        // A rejected zero key must not leave a usable session behind.
+        assert!(!session.has_valid_keys());
+    }
+
+    #[test]
+    fn decrypt_accepts_out_of_order_within_window() {
+        // Packets 3 then 1 (reordered in flight) must both decrypt; the replay
+        // window admits earlier-but-unseen counters within its span, and a
+        // subsequent replay of 3 is rejected.
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        let key = ExpresslaneKey([42u8; EXPRESSLANE_KEY_SIZE]);
+        sender.update_next_self_key(key).unwrap();
+        sender.promote_self_key();
+        receiver.update_peer_key(key).unwrap();
+
+        let session_id = [1u8; 8];
+        let make = |counter: u64| {
+            let pt = b"ordered";
+            let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + pt.len()];
+            let n = sender
+                .encrypt(counter, session_id, pt, [counter as u8; 12], false, &mut wire)
+                .unwrap();
+            wire.truncate(n);
+            wire
+        };
+        let p3 = make(3);
+        let p1 = make(1);
+
+        let mut out = vec![0u8; 7];
+        receiver.decrypt(session_id, &p3, &mut out).unwrap();
+        receiver.decrypt(session_id, &p1, &mut out).unwrap(); // earlier but unseen
+        assert_eq!(
+            receiver.decrypt(session_id, &p3, &mut out),
+            Err(ExpresslaneError::Replayed)
+        );
+        assert_eq!(receiver.packets_received(), 2);
+    }
+
+    #[test]
+    fn reserve_counter_uses_wrapping_arithmetic() {
+        // reserve_counter() uses wrapping_add so it cannot panic in a debug
+        // build when the internal counter reaches u64::MAX (release wrap
+        // sequence ..., MAX, 0, 1 matches lightway-core). Driving 2^64
+        // reservations is infeasible, so this documents the wrap directly.
+        let session = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        assert_eq!(session.reserve_counter(), 1);
+        assert_eq!(session.reserve_counter(), 2);
+        assert_eq!(u64::MAX.wrapping_add(1), 0);
     }
 }
