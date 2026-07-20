@@ -1500,7 +1500,10 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
     session_id: *const u8,
     out: *mut u8,
 ) -> he_return_code_t {
-    if out.is_null() || session_id.is_null() {
+    // Check all null pointers first so HE_ERR_NULL_POINTER always takes
+    // precedence over the reserved-session HE_ERR_BAD_PARAM check below (a null
+    // `client` is otherwise only caught later, inside lock_client).
+    if out.is_null() || session_id.is_null() || client.is_null() {
         return he_return_code_t::HE_ERR_NULL_POINTER;
     }
     // SAFETY: session_id is non-null (checked) and points to 8 readable bytes
@@ -2119,6 +2122,12 @@ mod tests {
             );
             assert_eq!(
                 he_conn_build_expresslane_header(c, std::ptr::null(), out.as_mut_ptr()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            // Null client → NULL_POINTER, and it must win over the reserved-
+            // session BAD_PARAM check (both bad here).
+            assert_eq!(
+                he_conn_build_expresslane_header(std::ptr::null(), [0u8; 8].as_ptr(), out.as_mut_ptr()),
                 he_return_code_t::HE_ERR_NULL_POINTER
             );
             he_client_destroy(c);
