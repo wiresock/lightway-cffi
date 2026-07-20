@@ -124,4 +124,7 @@ jobs:
           restore-keys: ubuntu-cargo-
 
       - name: Run Clippy
-        run: cargo clippy --workspace -- -D warnings
+        # --all-targets so test/example/bench code is linted too (the repo
+        # denies undocumented_unsafe_blocks; without this the FFI-heavy test
+        # modules would slip past CI).
+        run: cargo clippy --workspace --all-targets -- -D warnings

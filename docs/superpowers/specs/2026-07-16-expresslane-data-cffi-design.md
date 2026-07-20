@@ -297,15 +297,22 @@ not a redesign. That port is explicitly not part of this work.
 `lightway-core`'s `ExpresslaneData`, rather than sharing code with it. A bug
 fix or protocol change to one won't automatically apply to the other.
 
-Mitigation: a permanent cross-crate interop test (not a one-off migration
-check) runs in CI —
+Mitigation (implemented): pinned **golden wire vectors** in
+`lightway-expresslane/tests/wire_vectors.rs`. A fixed
+(key, session_id, counter, iv, plaintext, version) tuple is asserted to
+produce an exact byte sequence, and that sequence is asserted to decrypt
+back — so any drift in field layout, endianness, `is_encoded`/reserved flag
+handling, or AAD construction fails CI. The vector is a concrete artifact
+that can be cross-checked by hand against `lightway-core`'s output for the
+same inputs.
 
-- Encrypt via the full `he_conn_t` client (`lightway-cffi`), decrypt via
-  `he_expresslane_session_t` (`lightway-expresslane-cffi`), and vice versa.
-- Same key material, same session ID, round-trips both directions.
-
-This catches wire-format drift between the two implementations at CI time
-rather than in the field.
+Mitigation (follow-up, not yet implemented): a permanent cross-crate interop
+test that encrypts via the full `he_conn_t` client (`lightway-cffi`) and
+decrypts via `he_expresslane_session_t` (and vice versa). This needs a TLS
+handshake harness because `lightway-core`'s `ExpresslaneData` /
+`append_to_wire` are `pub(crate)` and only reachable through a live
+`Connection`; it is tracked as a separate task. Until it lands, the golden
+vectors above are the drift guard.
 
 ## Testing
 
