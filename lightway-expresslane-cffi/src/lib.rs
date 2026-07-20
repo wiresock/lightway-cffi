@@ -103,9 +103,12 @@ pub unsafe extern "C" fn he_expresslane_reserve_counter(
 }
 
 /// Shared body for the key setters: read the 32-byte key, install it into
-/// `session` via `install`, then scrub the stack copy so raw key material
+/// `session` via `install`, scrubbing the stack copy so raw key material
 /// does not linger in reused stack memory (matching the sibling
-/// `lightway-cffi` crate's key-handling discipline).
+/// `lightway-cffi` crate's key-handling discipline). The copy lives in a
+/// [`zeroize::Zeroizing`] wrapper, so it is scrubbed on drop even if the
+/// closure unwinds (e.g. a panic inside `install`), not just on the normal
+/// return path.
 ///
 /// # Safety
 /// `session` and `key` are dereferenced only after the null checks; `key`
@@ -116,25 +119,23 @@ fn set_key_from_ptr(
     key: *const u8,
     install: impl FnOnce(&ExpresslaneSession, ExpresslaneKey) -> lightway_expresslane::ExpresslaneResult<()>,
 ) -> he_expresslane_return_code_t {
-    use zeroize::Zeroize;
     if session.is_null() || key.is_null() {
         return he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_NULL_POINTER;
     }
     ffi_guard(he_expresslane_return_code_t::HE_EXPRESSLANE_ERR_PANIC, || {
         // SAFETY: null checks above; key points to EXPRESSLANE_KEY_SIZE
         // readable bytes per the caller's documented contract.
-        let mut key_bytes: [u8; EXPRESSLANE_KEY_SIZE] =
+        let key_bytes: zeroize::Zeroizing<[u8; EXPRESSLANE_KEY_SIZE]> = zeroize::Zeroizing::new(
             unsafe { std::slice::from_raw_parts(key, EXPRESSLANE_KEY_SIZE) }
                 .try_into()
-                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes");
+                .expect("slice has exactly EXPRESSLANE_KEY_SIZE bytes"),
+        );
         // SAFETY: null check above; session is valid for this call.
         let session = &unsafe { &*session }.0;
-        let rc = match install(session, ExpresslaneKey::from(key_bytes)) {
+        match install(session, ExpresslaneKey::from(*key_bytes)) {
             Ok(()) => he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS,
             Err(e) => e.into(),
-        };
-        key_bytes.zeroize();
-        rc
+        }
     })
 }
 
