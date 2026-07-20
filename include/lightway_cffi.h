@@ -1033,7 +1033,7 @@ he_return_code_t he_conn_identify_packet(const uint8_t *packet,
  `he_conn_get_session_id` changes.
 
  Returns:
- - `HE_ERR_NULL_POINTER` if `out` is null.
+ - `HE_ERR_NULL_POINTER` if `out` or `client` is null.
  - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, if the session
    is not yet established, or if called re-entrantly from within a callback
    that already holds the per-client lock.

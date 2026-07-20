@@ -1392,15 +1392,20 @@ pub unsafe extern "C" fn he_conn_identify_packet(
             *header_len = 0;
         }
     }
+    // A datagram shorter than the 16-byte header can't be a lightway frame, so
+    // leave it Undecidable (defaulted above) without allocating or parsing.
+    // This also guarantees the read below sees a non-null `packet` valid for
+    // WIRE_SIZE bytes (a null packet only reaches here with len == 0).
+    if len < Header::WIRE_SIZE {
+        return he_return_code_t::HE_SUCCESS;
+    }
     ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
         // Only the header window is needed; copy it into a BytesMut for the
-        // parser. A datagram shorter than the header simply fails to parse.
-        let n = len.min(Header::WIRE_SIZE);
-        let mut buf = BytesMut::with_capacity(n);
-        if n > 0 {
-            // SAFETY: packet is valid for `len` (>= n) readable bytes when len > 0.
-            buf.extend_from_slice(unsafe { std::slice::from_raw_parts(packet, n) });
-        }
+        // parser (which delegates to lightway-core, the wire-format authority).
+        let mut buf = BytesMut::with_capacity(Header::WIRE_SIZE);
+        // SAFETY: len >= WIRE_SIZE (checked above) and packet is non-null, so
+        // it is valid for WIRE_SIZE readable bytes.
+        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(packet, Header::WIRE_SIZE) });
         // A frame that fails to parse keeps the Undecidable / zero defaults
         // written above.
         if let Ok(hdr) = Header::try_from_wire(&mut buf) {
@@ -1443,7 +1448,7 @@ pub unsafe extern "C" fn he_conn_identify_packet(
 /// `he_conn_get_session_id` changes.
 ///
 /// Returns:
-/// - `HE_ERR_NULL_POINTER` if `out` is null.
+/// - `HE_ERR_NULL_POINTER` if `out` or `client` is null.
 /// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, if the session
 ///   is not yet established, or if called re-entrantly from within a callback
 ///   that already holds the per-client lock.
@@ -1488,13 +1493,18 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
             })
         };
         match result {
-            Ok(Ok(bm)) => {
+            // `append_to_wire` always writes exactly WIRE_SIZE bytes; the guard
+            // makes that a checked precondition of the copy rather than an
+            // assumption, so a future change that wrote fewer bytes fails fast
+            // instead of copying uninitialised memory across the FFI boundary.
+            Ok(Ok(bm)) if bm.len() >= Header::WIRE_SIZE => {
                 // SAFETY: out is non-null (checked) and writable for 16 bytes
-                // per the documented contract; append_to_wire wrote exactly
-                // WIRE_SIZE bytes into the distinct `bm` buffer.
+                // per the documented contract; `bm` holds >= WIRE_SIZE
+                // initialised bytes (guard above) and is a distinct buffer.
                 unsafe { std::ptr::copy_nonoverlapping(bm.as_ptr(), out, Header::WIRE_SIZE) };
                 he_return_code_t::HE_SUCCESS
             }
+            Ok(Ok(_)) => he_return_code_t::HE_ERR_FAILED,
             Ok(Err(code)) | Err(code) => code,
         }
     })
