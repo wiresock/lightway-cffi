@@ -34,7 +34,7 @@ const IV: [u8; 12] = [0x09u8; 12];
 const PLAINTEXT: &[u8] = b"expresslane golden vector";
 
 fn decode_hex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex vector must have an even number of digits");
+    assert!(s.len().is_multiple_of(2), "hex vector must have an even number of digits");
     s.as_bytes()
         .chunks_exact(2)
         .map(|pair| {
