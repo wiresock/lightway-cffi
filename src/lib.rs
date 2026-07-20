@@ -31,7 +31,7 @@ use lightway_core::{
     TickType,
 };
 
-use cffi_expresslane::CffiExpresslaneCb;
+use cffi_expresslane::{CffiExpresslaneCb, CffiExpresslaneMetrics};
 
 use cffi_event::CffiEventCallback;
 use cffi_io::{CffiInsideIO, CffiOutsideIO};
@@ -493,12 +493,16 @@ fn client_connect_locked(client: &mut he_client_t) -> he_return_code_t {
     };
 
     let ctx_builder = if client.ssl_ctx.enable_expresslane {
-        let b = ctx_builder.with_expresslane(DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL);
+        let mut b = ctx_builder.with_expresslane(DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL);
         if let Some(el_cb) = client.ssl_ctx.expresslane_cb {
-            b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx))
-        } else {
-            b
+            b = b.with_expresslane_cb(CffiExpresslaneCb::create(el_cb, conn_ptr, ctx));
         }
+        // When the data path is offloaded, feed the offload's packet counters to
+        // the health monitor so it doesn't read core's zeroed counters as loss.
+        if let Some(m_cb) = client.ssl_ctx.expresslane_metrics_cb {
+            b = b.with_expresslane_metrics(CffiExpresslaneMetrics::create(m_cb, conn_ptr, ctx));
+        }
+        b
     } else {
         ctx_builder
     };
@@ -1076,6 +1080,31 @@ pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_state_change_cb(
     }
     // SAFETY: null check above; ssl_ctx is valid for this call.
     unsafe { (*ssl_ctx).expresslane_state_change_cb = Some(cb) };
+    he_return_code_t::HE_SUCCESS
+}
+
+/// Register the callback that supplies offloaded ExpressLane packet counters
+/// to the health monitor.
+///
+/// Install this whenever the ExpressLane data path is offloaded (decrypt/encrypt
+/// via `he_expresslane_decrypt`/`he_expresslane_encrypt` instead of
+/// `he_conn_outside_data_received`/`he_conn_inside_packet_received`). Without it,
+/// `lightway-core`'s own packet counters stay at zero while the peer reports the
+/// real numbers, so the health monitor sees ~100% loss and degrades the fast
+/// path back to D/TLS. See `he_expresslane_metrics_cb_t`.
+///
+/// # Safety
+/// `ssl_ctx` must be a valid non-null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_ssl_ctx_set_expresslane_metrics_cb(
+    ssl_ctx: *mut conn::he_ssl_ctx_t,
+    cb: conn::he_expresslane_metrics_cb_t,
+) -> he_return_code_t {
+    if ssl_ctx.is_null() {
+        return he_return_code_t::HE_ERR_NULL_POINTER;
+    }
+    // SAFETY: null check above; ssl_ctx is valid for this call.
+    unsafe { (*ssl_ctx).expresslane_metrics_cb = Some(cb) };
     he_return_code_t::HE_SUCCESS
 }
 

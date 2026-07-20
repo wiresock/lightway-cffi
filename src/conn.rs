@@ -138,6 +138,26 @@ pub type he_expresslane_state_change_cb_t = unsafe extern "C" fn(
     context: *mut c_void,
 ) -> he_return_code_t;
 
+/// Called by the ExpressLane health monitor to read the offloaded packet
+/// counters for `session_id`. When the data path is offloaded (encrypt/decrypt
+/// via `he_expresslane_*` instead of `he_conn_t`), `lightway-core`'s own
+/// counters stay at zero and healthy traffic looks like 100% loss, degrading
+/// the fast path — so register this via `he_ssl_ctx_set_expresslane_metrics_cb`
+/// to report the real counters.
+///
+/// The callback must write the session's cumulative packets sent/received into
+/// `*sent` / `*received` (e.g. from `he_expresslane_packets_sent` /
+/// `he_expresslane_packets_received` on the matching `he_expresslane_session_t`)
+/// and return `HE_SUCCESS`. `session_id` points to 8 bytes valid only for the
+/// call. A non-`HE_SUCCESS` return is treated as zero counters.
+pub type he_expresslane_metrics_cb_t = unsafe extern "C" fn(
+    conn: *mut he_conn_t,
+    session_id: *const u8,
+    sent: *mut u64,
+    received: *mut u64,
+    context: *mut c_void,
+) -> he_return_code_t;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // SSL context (per-client configuration)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -162,6 +182,7 @@ pub struct he_ssl_ctx_t {
     pub(crate) pmtud_time_cb: Option<he_pmtud_time_cb_t>,
     pub(crate) expresslane_cb: Option<he_expresslane_cb_t>,
     pub(crate) expresslane_state_change_cb: Option<he_expresslane_state_change_cb_t>,
+    pub(crate) expresslane_metrics_cb: Option<he_expresslane_metrics_cb_t>,
 
     // Connection-level settings
     pub(crate) enable_expresslane: bool,
@@ -187,6 +208,7 @@ impl Default for he_ssl_ctx_t {
             auth_buf_cb: None,
             populate_network_config_ipv4_cb: None,
             pmtud_state_change_cb: None,
+            expresslane_metrics_cb: None,
             pmtud_time_cb: None,
             expresslane_cb: None,
             expresslane_state_change_cb: None,

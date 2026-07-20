@@ -490,6 +490,26 @@ typedef he_return_code_t (*he_expresslane_state_change_cb_t)(he_conn_t *conn,
                                                              he_expresslane_state_t state,
                                                              void *context);
 
+/*
+ Called by the ExpressLane health monitor to read the offloaded packet
+ counters for `session_id`. When the data path is offloaded (encrypt/decrypt
+ via `he_expresslane_*` instead of `he_conn_t`), `lightway-core`'s own
+ counters stay at zero and healthy traffic looks like 100% loss, degrading
+ the fast path — so register this via `he_ssl_ctx_set_expresslane_metrics_cb`
+ to report the real counters.
+
+ The callback must write the session's cumulative packets sent/received into
+ `*sent` / `*received` (e.g. from `he_expresslane_packets_sent` /
+ `he_expresslane_packets_received` on the matching `he_expresslane_session_t`)
+ and return `HE_SUCCESS`. `session_id` points to 8 bytes valid only for the
+ call. A non-`HE_SUCCESS` return is treated as zero counters.
+ */
+typedef he_return_code_t (*he_expresslane_metrics_cb_t)(he_conn_t *conn,
+                                                        const uint8_t *session_id,
+                                                        uint64_t *sent,
+                                                        uint64_t *received,
+                                                        void *context);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -853,6 +873,23 @@ he_return_code_t he_ssl_ctx_set_expresslane_cb(he_ssl_ctx_t *ssl_ctx, he_express
  */
 he_return_code_t he_ssl_ctx_set_expresslane_state_change_cb(he_ssl_ctx_t *ssl_ctx,
                                                             he_expresslane_state_change_cb_t cb);
+
+/*
+ Register the callback that supplies offloaded ExpressLane packet counters
+ to the health monitor.
+
+ Install this whenever the ExpressLane data path is offloaded (decrypt/encrypt
+ via `he_expresslane_decrypt`/`he_expresslane_encrypt` instead of
+ `he_conn_outside_data_received`/`he_conn_inside_packet_received`). Without it,
+ `lightway-core`'s own packet counters stay at zero while the peer reports the
+ real numbers, so the health monitor sees ~100% loss and degrades the fast
+ path back to D/TLS. See `he_expresslane_metrics_cb_t`.
+
+ # Safety
+ `ssl_ctx` must be a valid non-null pointer.
+ */
+he_return_code_t he_ssl_ctx_set_expresslane_metrics_cb(he_ssl_ctx_t *ssl_ctx,
+                                                       he_expresslane_metrics_cb_t cb);
 
 /*
  Set the username for password-based authentication.
