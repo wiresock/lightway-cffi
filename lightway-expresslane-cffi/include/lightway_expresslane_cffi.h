@@ -201,7 +201,8 @@ uint64_t he_expresslane_packets_sent(const he_expresslane_session_t *session);
  bytes (it may be NULL when `plain_text_len` is 0 — the conventional C
  idiom for an empty payload). `iv` must point to 12 readable bytes. `out`
  must point to `out_capacity` writable bytes and must NOT overlap any of
- the input buffers. `out_len` must be a valid pointer to a `size_t`.
+ the input buffers. `out_len` must be a valid pointer to a `uintptr_t`
+ (the C type cbindgen emits for the Rust `usize` length parameters).
  */
 he_expresslane_return_code_t he_expresslane_encrypt(const he_expresslane_session_t *session,
                                                     uint64_t counter,

@@ -216,7 +216,8 @@ pub unsafe extern "C" fn he_expresslane_packets_sent(
 /// bytes (it may be NULL when `plain_text_len` is 0 — the conventional C
 /// idiom for an empty payload). `iv` must point to 12 readable bytes. `out`
 /// must point to `out_capacity` writable bytes and must NOT overlap any of
-/// the input buffers. `out_len` must be a valid pointer to a `size_t`.
+/// the input buffers. `out_len` must be a valid pointer to a `uintptr_t`
+/// (the C type cbindgen emits for the Rust `usize` length parameters).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn he_expresslane_encrypt(
     session: *const he_expresslane_session_t,
@@ -276,7 +277,7 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
         match result {
             Ok(written) => {
                 // SAFETY: null check above; out_len is a valid pointer to a
-                // writable size_t per the function's documented contract.
+                // writable usize per the function's documented contract.
                 unsafe { *out_len = written };
                 he_expresslane_return_code_t::HE_EXPRESSLANE_SUCCESS
             }
