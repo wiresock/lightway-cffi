@@ -157,9 +157,12 @@ impl ExpresslaneSession {
     ///
     /// # IV / nonce uniqueness (security-critical)
     ///
-    /// `iv` is the AES-GCM nonce. The caller MUST supply a fresh,
-    /// unpredictable 12-byte `iv` for every packet encrypted under a given
-    /// key. Reusing a `(key, iv)` pair is catastrophic for AES-GCM: it leaks
+    /// `iv` is the AES-GCM nonce. The caller MUST supply a UNIQUE 12-byte
+    /// `iv` for every packet encrypted under a given key — either a
+    /// deterministic construction that cannot repeat (e.g. derived from a
+    /// per-key message counter) or random generation from a CSPRNG when no
+    /// such guarantee exists. Predictability is not the concern; repetition
+    /// is: reusing a `(key, iv)` pair is catastrophic for AES-GCM — it leaks
     /// the XOR of the two plaintexts and allows recovery of the GHASH
     /// authentication key, i.e. arbitrary packet forgery. The wire `counter`
     /// is authenticated via the AAD but is NOT the nonce and does not by

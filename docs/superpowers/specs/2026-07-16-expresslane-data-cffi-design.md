@@ -269,9 +269,12 @@ every thread encrypting on that session.
 - **IV**: caller-supplied on encrypt (matches `lightway-core`'s existing
   pattern where `Connection` generates the IV and passes it into
   `append_to_wire`). The crate itself has no RNG dependency. Caller is
-  responsible for a fresh, unpredictable 12-byte IV per packet per key —
-  reusing an (key, IV) pair breaks AES-GCM's security guarantees; the wire
-  counter is authenticated via AAD but is not itself the nonce.
+  responsible for a UNIQUE 12-byte IV per packet per key — a deterministic
+  never-repeating construction (e.g. derived from a per-key message counter)
+  or CSPRNG randomness when no such guarantee exists. Uniqueness, not
+  unpredictability, is AES-GCM's requirement: reusing a (key, IV) pair breaks
+  its security guarantees; the wire counter is authenticated via AAD but is
+  not itself the nonce.
 - **Key sync**: out of scope, per the "Non-goals" section. The external app
   gets key material from the existing `he_expresslane_cb_t` /
   `he_expresslane_state_change_cb_t` callbacks on the full client and pushes

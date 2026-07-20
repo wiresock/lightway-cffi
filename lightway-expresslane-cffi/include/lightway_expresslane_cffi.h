@@ -185,12 +185,15 @@ uint64_t he_expresslane_packets_sent(const he_expresslane_session_t *session);
  `*out_len` is set to the number of bytes written to `out`.
 
  # IV / nonce uniqueness (SECURITY-CRITICAL)
- `iv` is the AES-GCM nonce. The caller MUST supply a fresh, unpredictable
- 12-byte `iv` for every packet encrypted under a given key. Reusing a
+ `iv` is the AES-GCM nonce. The caller MUST supply a UNIQUE 12-byte `iv`
+ for every packet encrypted under a given key — either a deterministic
+ construction that cannot repeat (e.g. derived from a per-key message
+ counter) or random generation from a CSPRNG when no such guarantee
+ exists. Predictability is not the concern; repetition is: reusing a
  `(key, iv)` pair is catastrophic for AES-GCM — it leaks the XOR of the
- plaintexts and enables forgery of arbitrary packets. The `counter` is
- authenticated but is NOT the nonce; a unique `counter` does not make the
- `iv` unique. This library has no RNG and cannot enforce this.
+ plaintexts and enables forgery of arbitrary packets. The `counter`
+ argument is authenticated but is NOT the nonce; a unique `counter` does
+ not make the `iv` unique. This library has no RNG and cannot enforce this.
 
  # Safety
  `session` must be a valid non-null pointer. `session_id` must point to 8
