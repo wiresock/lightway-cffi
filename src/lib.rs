@@ -28,7 +28,7 @@ use bytes::BytesMut;
 use lightway_core::{
     AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
     Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, SessionId,
-    TickType,
+    State, TickType,
 };
 
 use cffi_expresslane::{CffiExpresslaneCb, CffiExpresslaneMetrics};
@@ -1573,6 +1573,14 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
 /// when actually due. A `degraded`/`not-supported` connection is treated as
 /// "nothing to rotate" and reported as success.
 ///
+/// A connection that is not yet `Online` is also a success no-op. This matters
+/// because `he_conn_nudge` must also be driven during the handshake: with
+/// `last_key_rotation` still unset, a pre-`Online` call would otherwise burn
+/// the very first rotation on an `ExpresslaneConfig` the peer cannot receive
+/// yet, and the timestamp it sets would suppress the activation-time initial
+/// key share at `State::Online` for a full rotation interval — leaving the
+/// fast path without keys.
+///
 /// Returns `HE_ERR_NULL_POINTER` for a null `conn`, `HE_ERR_INVALID_CONN_STATE`
 /// if no connection is active yet, and `HE_SUCCESS` otherwise.
 ///
@@ -1595,6 +1603,13 @@ pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t)
                 let Some(ref mut connection) = client.connection else {
                     return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                 };
+                // Not yet Online: rotating now would consume the first
+                // time_to_rotate_key() pass on an unsendable config and suppress
+                // the activation-time initial key share (see doc comment). Treat
+                // as "not due yet", like any other early wake-up.
+                if connection.state() != State::Online {
+                    return Ok(());
+                }
                 // Self-gated by time_to_rotate_key(); the only error it returns is
                 // "expresslane degraded", a benign no-op for a periodic caller.
                 let _ = connection.rotate_expresslane_key();
