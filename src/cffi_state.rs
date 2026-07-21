@@ -20,9 +20,19 @@ use crate::conn::{he_conn_t, he_nudge_time_cb_t};
 
 /// Application state carried inside every `Connection<CffiAppState>`.
 pub(crate) struct CffiAppState {
-    /// The earliest time at which `conn.tick()` should next be called.
+    /// The earliest time at which `conn.tick()` should next be called with a
+    /// plain `ConnectionTick`.
     /// Set by `schedule_tick_cb`; consumed (and reset) by `he_conn_nudge`.
     pub(crate) next_tick: Option<Instant>,
+
+    /// Payload-carrying ticks (`ExpresslaneKeyShareTick`, `PktCodecTick`)
+    /// scheduled by lightway-core, stored as the whole received `TickType` so
+    /// `he_conn_nudge` can round-trip each one to `Connection::tick()`
+    /// verbatim once its deadline passes. These cannot be folded into
+    /// `next_tick`: dispatched as a `ConnectionTick` their retransmit payload
+    /// is lost. (`ExpresslaneTickData` is not nameable outside lightway-core,
+    /// so the value is stored, never reconstructed.)
+    pub(crate) pending_ticks: Vec<(Instant, lightway_core::TickType)>,
 
     /// Inside IP config received from the server (populated by `CffiIpConfig`).
     pub(crate) ip_config: Option<InsideIpConfig>,
@@ -40,6 +50,7 @@ impl Default for CffiAppState {
     fn default() -> Self {
         Self {
             next_tick: None,
+            pending_ticks: Vec::new(),
             ip_config: None,
             nudge_time_cb: None,
             conn_ptr: std::ptr::null_mut(),
@@ -67,14 +78,28 @@ unsafe impl Sync for CffiAppState {}
 pub(crate) fn cffi_schedule_tick_cb(
     d: Duration,
     state: &mut CffiAppState,
-    _tick_type: lightway_core::TickType,
+    tick_type: lightway_core::TickType,
 ) {
     let deadline = Instant::now() + d;
-    // Keep the earliest pending deadline.
-    state.next_tick = Some(match state.next_tick {
-        Some(existing) if existing <= deadline => existing,
-        _ => deadline,
-    });
+    match tick_type {
+        // ConnectionTick is stateless, so deadlines can be merged: keep the
+        // earliest pending one.
+        lightway_core::TickType::ConnectionTick => {
+            state.next_tick = Some(match state.next_tick {
+                Some(existing) if existing <= deadline => existing,
+                _ => deadline,
+            });
+        }
+        // Payload-carrying ticks (ExpresslaneKeyShareTick, PktCodecTick) must
+        // be round-tripped to Connection::tick() with their original type and
+        // payload — dispatched as a plain ConnectionTick their retransmit
+        // state is lost, and e.g. a dropped ExpresslaneConfig/ack would then
+        // never be retried. Stale entries are harmless (core's handlers drop
+        // ticks whose counter / request id no longer matches) and each
+        // retransmit only reschedules after its predecessor was consumed, so
+        // this list stays tiny.
+        other => state.pending_ticks.push((deadline, other)),
+    }
 
     // Notify the C caller so it can wake its nudge thread (e.g. signal
     // nudge_event_ in the C++ lightway_tunnel nudge_thread).

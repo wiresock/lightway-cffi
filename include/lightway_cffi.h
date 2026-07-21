@@ -1117,7 +1117,10 @@ he_return_code_t he_conn_build_expresslane_header(const he_client_t *client,
  `time_to_rotate_key()` check, so it is a cheap no-op until the interval
  elapses and only rotates — sending a single `ExpresslaneConfig` frame —
  when actually due. A `degraded`/`not-supported` connection is treated as
- "nothing to rotate" and reported as success.
+ "nothing to rotate" and reported as success. When a rotation is initiated,
+ the value returned by `he_conn_get_nudge_time()` is refreshed to reflect
+ the scheduled key-share retransmit deadline, so a caller that re-reads it
+ after this call wakes in time to drive the retransmit.
 
  A connection in any state other than `Online` (before it, or after —
  disconnecting/disconnected) is also a success no-op; rotation only ever
@@ -1168,7 +1171,8 @@ he_return_code_t he_conn_inside_packet_received(he_conn_t *conn, uint8_t *packet
 
 /*
  Nudge the connection — retransmit handshake messages if the keepalive
- timer has expired.
+ timer has expired, and dispatch any due payload ticks (ExpressLane
+ key-share retransmits, codec retransmits) with their original tick type.
 
  # Safety
  `conn` must be a valid non-null pointer.

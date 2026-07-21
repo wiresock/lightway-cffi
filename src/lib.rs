@@ -1571,7 +1571,10 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
 /// `time_to_rotate_key()` check, so it is a cheap no-op until the interval
 /// elapses and only rotates — sending a single `ExpresslaneConfig` frame —
 /// when actually due. A `degraded`/`not-supported` connection is treated as
-/// "nothing to rotate" and reported as success.
+/// "nothing to rotate" and reported as success. When a rotation is initiated,
+/// the value returned by `he_conn_get_nudge_time()` is refreshed to reflect
+/// the scheduled key-share retransmit deadline, so a caller that re-reads it
+/// after this call wakes in time to drive the retransmit.
 ///
 /// A connection in any state other than `Online` (before it, or after —
 /// disconnecting/disconnected) is also a success no-op; rotation only ever
@@ -1618,6 +1621,13 @@ pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t)
                 // Self-gated by time_to_rotate_key(); the only error it returns is
                 // "expresslane degraded", a benign no-op for a periodic caller.
                 let _ = connection.rotate_expresslane_key();
+                // A rotation schedules a key-share retransmit tick; refresh the
+                // cached nudge_time_ms so the caller's next
+                // he_conn_get_nudge_time() reflects that short deadline instead
+                // of overwriting the wake-up hint with a stale/zero value.
+                let now = std::time::Instant::now();
+                client.conn.nudge_time_ms =
+                    nudge_ms_until(earliest_tick_deadline(connection.app_state()), now);
                 Ok(())
             })
         } {
@@ -1770,8 +1780,32 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
     })
 }
 
+/// Earliest pending tick deadline across the `ConnectionTick` slot and the
+/// payload ticks. Drives `nudge_time_ms` so the C caller wakes for whichever
+/// timer fires first (a 500 ms key-share retransmit must not wait behind a
+/// multi-second connection tick).
+fn earliest_tick_deadline(state: &CffiAppState) -> Option<std::time::Instant> {
+    let pending = state.pending_ticks.iter().map(|(t, _)| *t).min();
+    match (state.next_tick, pending) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Remaining milliseconds from `now` until `deadline`, saturating; 0 when no
+/// deadline is pending.
+fn nudge_ms_until(deadline: Option<std::time::Instant>, now: std::time::Instant) -> i32 {
+    deadline
+        .map(|t| {
+            let remaining = t.saturating_duration_since(now);
+            remaining.as_millis().min(i32::MAX as u128) as i32
+        })
+        .unwrap_or(0)
+}
+
 /// Nudge the connection — retransmit handshake messages if the keepalive
-/// timer has expired.
+/// timer has expired, and dispatch any due payload ticks (ExpressLane
+/// key-share retransmits, codec retransmits) with their original tick type.
 ///
 /// # Safety
 /// `conn` must be a valid non-null pointer.
@@ -1793,39 +1827,55 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 // Capture now after acquiring the lock so tick decisions and
                 // nudge_ms computations reflect a consistent, current instant.
                 let now = std::time::Instant::now();
-                let Some(ref mut connection) = client.connection else {
-                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
-                };
-                let should_tick = connection.app_state().next_tick.is_none_or(|t| now >= t);
-                if should_tick {
-                    connection.app_state_mut().next_tick = None;
-                    match connection.tick(TickType::ConnectionTick) {
-                        Ok(()) => {}
-                        Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
+                {
+                    let Some(ref mut connection) = client.connection else {
+                        return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                    };
+                    let should_tick =
+                        connection.app_state().next_tick.is_none_or(|t| now >= t);
+                    if should_tick {
+                        connection.app_state_mut().next_tick = None;
+                        match connection.tick(TickType::ConnectionTick) {
+                            Ok(()) => {}
+                            Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
+                        }
+                        sync_conn_info(client);
                     }
-                    sync_conn_info(client);
-                    // Compute nudge_ms using the pre-captured `now` for consistency.
-                    let nudge_ms = client
-                        .connection
-                        .as_ref()
-                        .and_then(|c| c.app_state().next_tick)
-                        .map(|t| {
-                            let remaining = t.saturating_duration_since(now);
-                            remaining.as_millis().min(i32::MAX as u128) as i32
-                        })
-                        .unwrap_or(0);
-                    client.conn.nudge_time_ms = nudge_ms;
-                } else {
-                    let nudge_ms = connection
-                        .app_state()
-                        .next_tick
-                        .map(|t| {
-                            let remaining = t.saturating_duration_since(now);
-                            remaining.as_millis().min(i32::MAX as u128) as i32
-                        })
-                        .unwrap_or(0);
-                    client.conn.nudge_time_ms = nudge_ms;
                 }
+
+                // Dispatch every due payload tick with its original TickType —
+                // these carry retransmit state Connection::tick() needs. This
+                // runs on every nudge, not only when the ConnectionTick
+                // deadline passed: their deadlines (e.g. a 500 ms key-share
+                // retransmit) are typically much shorter. A dispatched tick may
+                // reschedule its successor via cffi_schedule_tick_cb (pushing a
+                // new, future entry), which the `now >=` check leaves alone, so
+                // this loop terminates. Errors are swallowed: core rejects
+                // stale/off-state retransmit ticks by design (counter and
+                // request-id checks), and a dropped retransmit must not fail
+                // the whole nudge.
+                loop {
+                    let Some(ref mut connection) = client.connection else {
+                        return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                    };
+                    let due_idx = connection
+                        .app_state()
+                        .pending_ticks
+                        .iter()
+                        .position(|(t, _)| now >= *t);
+                    let Some(idx) = due_idx else { break };
+                    let (_, tick) = connection.app_state_mut().pending_ticks.swap_remove(idx);
+                    let _ = connection.tick(tick);
+                }
+
+                // Recompute nudge_ms from whatever deadlines remain (the ticks
+                // above may have rescheduled), using the pre-captured `now`.
+                let nudge_ms = client
+                    .connection
+                    .as_ref()
+                    .map(|c| nudge_ms_until(earliest_tick_deadline(c.app_state()), now))
+                    .unwrap_or(0);
+                client.conn.nudge_time_ms = nudge_ms;
                 Ok(())
             })
         } {
@@ -2025,6 +2075,42 @@ mod tests {
             );
             he_client_destroy(c);
         }
+    }
+
+    #[test]
+    fn schedule_tick_cb_keeps_payload_ticks_typed() {
+        let mut state = CffiAppState::default();
+        // A payload tick must be stored verbatim, not folded into next_tick —
+        // folding would later dispatch it as a ConnectionTick and silently
+        // drop the retransmit it carries. (ExpresslaneKeyShareTick is not
+        // constructible outside lightway-core; PktCodecTick exercises the
+        // same non-ConnectionTick storage path.)
+        cffi_schedule_tick_cb(
+            std::time::Duration::from_millis(500),
+            &mut state,
+            TickType::PktCodecTick(7),
+        );
+        assert!(state.next_tick.is_none());
+        assert_eq!(state.pending_ticks.len(), 1);
+        assert!(matches!(
+            state.pending_ticks[0].1,
+            TickType::PktCodecTick(7)
+        ));
+
+        // A ConnectionTick keeps using the merged next_tick slot.
+        cffi_schedule_tick_cb(
+            std::time::Duration::from_secs(10),
+            &mut state,
+            TickType::ConnectionTick,
+        );
+        assert!(state.next_tick.is_some());
+        assert_eq!(state.pending_ticks.len(), 1);
+
+        // The wake-up deadline is the earlier of the two — the 500 ms payload
+        // tick, not the 10 s connection tick.
+        let earliest = earliest_tick_deadline(&state).expect("two deadlines pending");
+        assert_eq!(earliest, state.pending_ticks[0].0);
+        assert!(earliest < state.next_tick.expect("connection tick pending"));
     }
 
     #[test]
