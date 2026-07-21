@@ -1573,16 +1573,21 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
 /// when actually due. A `degraded`/`not-supported` connection is treated as
 /// "nothing to rotate" and reported as success.
 ///
-/// A connection that is not yet `Online` is also a success no-op. This matters
-/// because `he_conn_nudge` must also be driven during the handshake: with
-/// `last_key_rotation` still unset, a pre-`Online` call would otherwise burn
-/// the very first rotation on an `ExpresslaneConfig` the peer cannot receive
-/// yet, and the timestamp it sets would suppress the activation-time initial
-/// key share at `State::Online` for a full rotation interval — leaving the
-/// fast path without keys.
+/// A connection in any state other than `Online` (before it, or after —
+/// disconnecting/disconnected) is also a success no-op; rotation only ever
+/// happens while `Online`. The pre-`Online` case is the one that matters in
+/// practice, because `he_conn_nudge` must also be driven during the handshake:
+/// with `last_key_rotation` still unset, a pre-`Online` call would otherwise
+/// burn the very first rotation on an `ExpresslaneConfig` the peer cannot
+/// receive yet, and the timestamp it sets would suppress the activation-time
+/// initial key share at `State::Online` for a full rotation interval — leaving
+/// the fast path without keys.
 ///
-/// Returns `HE_ERR_NULL_POINTER` for a null `conn`, `HE_ERR_INVALID_CONN_STATE`
-/// if no connection is active yet, and `HE_SUCCESS` otherwise.
+/// Returns:
+/// - `HE_ERR_NULL_POINTER` for a null `conn`.
+/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+///   re-entrantly from within a callback that already holds the per-client lock.
+/// - `HE_SUCCESS` otherwise (including every no-op case above).
 ///
 /// # Safety
 /// `conn` must be null or a pointer obtained from `he_client_get_conn()` on a
@@ -1603,10 +1608,10 @@ pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t)
                 let Some(ref mut connection) = client.connection else {
                     return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                 };
-                // Not yet Online: rotating now would consume the first
-                // time_to_rotate_key() pass on an unsendable config and suppress
-                // the activation-time initial key share (see doc comment). Treat
-                // as "not due yet", like any other early wake-up.
+                // Not Online (pre-handshake or tearing down): rotating now would
+                // consume the first time_to_rotate_key() pass on an unsendable
+                // config and suppress the activation-time initial key share (see
+                // doc comment). Treat as "not due yet", like any early wake-up.
                 if connection.state() != State::Online {
                     return Ok(());
                 }
