@@ -1835,10 +1835,18 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                     let Some(ref mut connection) = client.connection else {
                         return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                     };
+                    // `next_tick` is the ConnectionTick slot only (payload ticks
+                    // live in `pending_ticks`). `is_some_and`, not `is_none_or`: a
+                    // nudge with no scheduled ConnectionTick (None) must NOT
+                    // synthesize one — doing so runs connection_tick on an
+                    // Online-idle connection, which polls DTLS-timeout state that
+                    // lightway-core deliberately stops checking once Online and can
+                    // trip a spurious disconnect. A payload-only nudge then just
+                    // dispatches its due payload ticks below.
                     let should_tick = connection
                         .app_state()
                         .next_tick
-                        .is_none_or(|t| connection_tick_now >= t);
+                        .is_some_and(|t| connection_tick_now >= t);
                     if should_tick {
                         connection.app_state_mut().next_tick = None;
                         connection.tick(TickType::ConnectionTick).err()
