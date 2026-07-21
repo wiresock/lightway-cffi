@@ -58,6 +58,29 @@ impl CffiAppState {
     }
 }
 
+/// Convert a timer duration to the C API's millisecond timeout.
+///
+/// Positive sub-millisecond durations must round up to 1 ms: callers use 0 to
+/// mean "no timer", so truncating a still-future deadline to 0 can make the
+/// host clear its wake-up before the tick is actually due.
+pub(crate) fn duration_to_timeout_ms(duration: Duration) -> i32 {
+    let millis = duration.as_millis();
+    let rounded_up = if duration.subsec_nanos().is_multiple_of(1_000_000) {
+        millis
+    } else {
+        millis + 1
+    };
+    rounded_up.min(i32::MAX as u128) as i32
+}
+
+/// Millisecond timeout for an outstanding deadline.
+///
+/// Unlike a bare duration, an outstanding deadline must never produce 0:
+/// even when it is already due, the host still needs an immediate wake-up.
+pub(crate) fn deadline_to_timeout_ms(deadline: Instant, now: Instant) -> i32 {
+    duration_to_timeout_ms(deadline.saturating_duration_since(now)).max(1)
+}
+
 impl Default for CffiAppState {
     fn default() -> Self {
         Self {
@@ -125,10 +148,7 @@ pub(crate) fn cffi_schedule_tick_cb(
         // The deadline just inserted makes the state non-empty; unwrap_or is
         // pure defensiveness.
         let earliest = state.earliest_tick_deadline().unwrap_or(deadline);
-        let timeout_ms = earliest
-            .saturating_duration_since(now)
-            .as_millis()
-            .min(i32::MAX as u128) as i32;
+        let timeout_ms = deadline_to_timeout_ms(earliest, now);
         // SAFETY: conn_ptr and ctx are valid C pointers for the connection
         // lifetime; the C callback only uses them to look up its own state.
         unsafe { cb(state.conn_ptr, timeout_ms, state.ctx) };
