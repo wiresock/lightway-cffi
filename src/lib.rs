@@ -1793,6 +1793,7 @@ fn nudge_ms_until(deadline: Option<std::time::Instant>, now: std::time::Instant)
 fn handle_connection_tick_error(
     client: &mut he_client_t,
     error: lightway_core::ConnectionError,
+    connection_type: ConnectionType,
 ) -> he_return_code_t {
     if matches!(error, lightway_core::ConnectionError::TimedOut) {
         // TimedOut is fatal. Clear the public timer before the disconnect
@@ -1801,9 +1802,41 @@ fn handle_connection_tick_error(
         client.conn.nudge_time_ms = 0;
         fatal_disconnect(client);
         he_return_code_t::HE_CONNECTION_TIMED_OUT
+    } else if error.is_fatal(connection_type) {
+        // Keep tick error handling consistent with the wire receive path:
+        // fatal core errors leave no usable connection behind, even when the
+        // error did not happen to be the dedicated timeout variant.
+        client.conn.nudge_time_ms = 0;
+        fatal_disconnect(client);
+        he_return_code_t::HE_ERR_FAILED
     } else {
         he_return_code_t::HE_ERR_FAILED
     }
+}
+
+/// Re-arm a retryable failed connection tick and report whether it was armed.
+///
+/// Authentication retransmits can fail transiently while sending outside. The
+/// connection remains usable in that case, so consuming its only tick would
+/// leave the handshake unable to retry or reach its timeout. Online ticks are
+/// deliberately never synthesized/re-armed here: an idle Online connection has
+/// no connection timer, and polling its stale DTLS timeout is unsafe.
+fn retry_connection_tick_after_error(
+    error: &lightway_core::ConnectionError,
+    connection_type: ConnectionType,
+    connection_state: State,
+    retry_delay: std::time::Duration,
+    app_state: &mut CffiAppState,
+) -> bool {
+    let should_retry = !error.is_fatal(connection_type)
+        && matches!(
+            connection_state,
+            State::Connecting | State::LinkUp | State::Authenticating
+        );
+    if should_retry {
+        cffi_schedule_tick_cb(retry_delay, app_state, TickType::ConnectionTick);
+    }
+    should_retry
 }
 
 /// Nudge the connection — retransmit handshake messages if the keepalive
@@ -1848,14 +1881,46 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                         .next_tick
                         .is_some_and(|t| connection_tick_now >= t);
                     if should_tick {
+                        // Save the current interval before consuming the tick.
+                        // connection_tick() normally schedules its successor,
+                        // but an early error (for example while resending auth)
+                        // returns before update_tick_interval() can do so.
+                        let retry_delay = connection
+                            .tick_interval()
+                            .unwrap_or(std::time::Duration::from_millis(1));
+                        let connection_type = connection.connection_type();
                         connection.app_state_mut().next_tick = None;
-                        connection.tick(TickType::ConnectionTick).err()
+                        match connection.tick(TickType::ConnectionTick) {
+                            Ok(()) => None,
+                            Err(error) => {
+                                retry_connection_tick_after_error(
+                                    &error,
+                                    connection_type,
+                                    connection.state(),
+                                    retry_delay,
+                                    connection.app_state_mut(),
+                                );
+                                Some((error, connection_type))
+                            }
+                        }
                     } else {
                         None
                     }
                 };
-                if let Some(error) = tick_error {
-                    return Err(handle_connection_tick_error(client, error));
+                if let Some((error, connection_type)) = tick_error {
+                    // Keep the public timer in sync with the retry (or any
+                    // payload deadline that remains) before returning the
+                    // error. A callback-driven host was already notified by
+                    // cffi_schedule_tick_cb above; polling hosts see this value.
+                    let timeout_now = std::time::Instant::now();
+                    client.conn.nudge_time_ms = client
+                        .connection
+                        .as_ref()
+                        .map(|c| {
+                            nudge_ms_until(c.app_state().earliest_tick_deadline(), timeout_now)
+                        })
+                        .unwrap_or(0);
+                    return Err(handle_connection_tick_error(client, error, connection_type));
                 }
                 sync_conn_info(client);
 
@@ -1868,22 +1933,34 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 // back BEFORE dispatching, because a dispatched tick may
                 // reschedule its successor via cffi_schedule_tick_cb, which
                 // appends to the stored list (those successors wait for the
-                // next nudge). Errors are swallowed: core rejects
-                // stale/off-state retransmit ticks by design (counter and
-                // request-id checks), and a dropped retransmit must not fail
-                // the whole nudge.
-                {
+                // next nudge). Benign errors are ignored because stale or
+                // off-state retransmits must not fail the whole nudge. Fatal
+                // errors still tear down the connection, matching the wire and
+                // ConnectionTick paths rather than leaving a dead core object
+                // installed in the C client.
+                let payload_tick_error = {
                     let Some(ref mut connection) = client.connection else {
                         return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                     };
+                    let connection_type = connection.connection_type();
                     let payload_now = std::time::Instant::now();
                     let pending = std::mem::take(&mut connection.app_state_mut().pending_ticks);
                     let (due, remaining): (Vec<_>, Vec<_>) =
                         pending.into_iter().partition(|(t, _)| payload_now >= *t);
                     connection.app_state_mut().pending_ticks = remaining;
+                    let mut fatal_error = None;
                     for (_, tick) in due {
-                        let _ = connection.tick(tick);
+                        if let Err(error) = connection.tick(tick)
+                            && error.is_fatal(connection_type)
+                        {
+                            fatal_error = Some(error);
+                            break;
+                        }
                     }
+                    fatal_error.map(|error| (error, connection_type))
+                };
+                if let Some((error, connection_type)) = payload_tick_error {
+                    return Err(handle_connection_tick_error(client, error, connection_type));
                 }
 
                 // Recompute nudge_ms from whatever deadlines remain (the ticks
@@ -2304,8 +2381,11 @@ mod tests {
         client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
         client.conn.nudge_time_ms = 250;
 
-        let rc =
-            handle_connection_tick_error(&mut client, lightway_core::ConnectionError::TimedOut);
+        let rc = handle_connection_tick_error(
+            &mut client,
+            lightway_core::ConnectionError::TimedOut,
+            ConnectionType::Datagram,
+        );
 
         assert_eq!(rc, he_return_code_t::HE_CONNECTION_TIMED_OUT);
         assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_DISCONNECTED);
@@ -2319,12 +2399,87 @@ mod tests {
         client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
         client.conn.nudge_time_ms = 250;
 
-        let rc =
-            handle_connection_tick_error(&mut client, lightway_core::ConnectionError::InvalidState);
+        let rc = handle_connection_tick_error(
+            &mut client,
+            lightway_core::ConnectionError::InvalidState,
+            ConnectionType::Datagram,
+        );
 
         assert_eq!(rc, he_return_code_t::HE_ERR_FAILED);
         assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_CONNECTING);
         assert_eq!(client.conn.nudge_time_ms, 250);
+    }
+
+    #[test]
+    fn fatal_non_timeout_tick_error_disconnects_client() {
+        let mut client = he_client_t::new();
+        client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
+        client.conn.nudge_time_ms = 250;
+
+        let rc = handle_connection_tick_error(
+            &mut client,
+            lightway_core::ConnectionError::Disconnected,
+            ConnectionType::Datagram,
+        );
+
+        assert_eq!(rc, he_return_code_t::HE_ERR_FAILED);
+        assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_DISCONNECTED);
+        assert_eq!(client.conn.nudge_time_ms, 0);
+        assert!(client.connection.is_none());
+    }
+
+    #[test]
+    fn connection_tick_error_rearms_only_pre_online_retry() {
+        let retry_delay = std::time::Duration::from_millis(250);
+        let non_timeout = lightway_core::ConnectionError::InvalidState;
+
+        let mut connecting = CffiAppState::default();
+        assert!(retry_connection_tick_after_error(
+            &non_timeout,
+            ConnectionType::Datagram,
+            State::Authenticating,
+            retry_delay,
+            &mut connecting,
+        ));
+        let retry_deadline = connecting.next_tick.expect("retry tick scheduled");
+        let remaining = retry_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(remaining <= retry_delay);
+        assert!(remaining > std::time::Duration::ZERO);
+
+        // An idle Online connection must remain without a ConnectionTick;
+        // re-arming it would restore the synthetic-tick timeout bug.
+        let mut online = CffiAppState::default();
+        assert!(!retry_connection_tick_after_error(
+            &non_timeout,
+            ConnectionType::Datagram,
+            State::Online,
+            retry_delay,
+            &mut online,
+        ));
+        assert!(online.next_tick.is_none());
+
+        // A timeout is torn down by handle_connection_tick_error, not retried.
+        let mut timed_out = CffiAppState::default();
+        assert!(!retry_connection_tick_after_error(
+            &lightway_core::ConnectionError::TimedOut,
+            ConnectionType::Datagram,
+            State::Authenticating,
+            retry_delay,
+            &mut timed_out,
+        ));
+        assert!(timed_out.next_tick.is_none());
+
+        // A pre-online error is not retryable merely because of the state;
+        // core's fatality classification still wins.
+        let mut fatal = CffiAppState::default();
+        assert!(!retry_connection_tick_after_error(
+            &lightway_core::ConnectionError::Disconnected,
+            ConnectionType::Datagram,
+            State::Authenticating,
+            retry_delay,
+            &mut fatal,
+        ));
+        assert!(fatal.next_tick.is_none());
     }
 
     #[test]
