@@ -1847,25 +1847,26 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 // these carry retransmit state Connection::tick() needs. This
                 // runs on every nudge, not only when the ConnectionTick
                 // deadline passed: their deadlines (e.g. a 500 ms key-share
-                // retransmit) are typically much shorter. A dispatched tick may
-                // reschedule its successor via cffi_schedule_tick_cb (pushing a
-                // new, future entry), which the `now >=` check leaves alone, so
-                // this loop terminates. Errors are swallowed: core rejects
+                // retransmit) are typically much shorter. The due set is
+                // snapshotted in one pass; the not-yet-due remainder is stored
+                // back BEFORE dispatching, because a dispatched tick may
+                // reschedule its successor via cffi_schedule_tick_cb, which
+                // appends to the stored list (those successors wait for the
+                // next nudge). Errors are swallowed: core rejects
                 // stale/off-state retransmit ticks by design (counter and
                 // request-id checks), and a dropped retransmit must not fail
                 // the whole nudge.
-                loop {
+                {
                     let Some(ref mut connection) = client.connection else {
                         return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                     };
-                    let due_idx = connection
-                        .app_state()
-                        .pending_ticks
-                        .iter()
-                        .position(|(t, _)| now >= *t);
-                    let Some(idx) = due_idx else { break };
-                    let (_, tick) = connection.app_state_mut().pending_ticks.swap_remove(idx);
-                    let _ = connection.tick(tick);
+                    let pending = std::mem::take(&mut connection.app_state_mut().pending_ticks);
+                    let (due, remaining): (Vec<_>, Vec<_>) =
+                        pending.into_iter().partition(|(t, _)| now >= *t);
+                    connection.app_state_mut().pending_ticks = remaining;
+                    for (_, tick) in due {
+                        let _ = connection.tick(tick);
+                    }
                 }
 
                 // Recompute nudge_ms from whatever deadlines remain (the ticks
