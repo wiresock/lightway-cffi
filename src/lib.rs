@@ -1811,7 +1811,7 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 // lock. Payload timers get their own fresh decision time below,
                 // since this tick may run callbacks before they are examined.
                 let connection_tick_now = std::time::Instant::now();
-                {
+                let tick_error = {
                     let Some(ref mut connection) = client.connection else {
                         return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                     };
@@ -1822,12 +1822,29 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                     if should_tick {
                         connection.app_state_mut().next_tick = None;
                         match connection.tick(TickType::ConnectionTick) {
-                            Ok(()) => {}
-                            Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
+                            Ok(()) => None,
+                            // TimedOut means connection_tick already disconnected
+                            // the client; surface it distinctly so the C caller can
+                            // tolerate the timeout instead of logging a hard failure
+                            // every nudge cycle.
+                            Err(lightway_core::ConnectionError::TimedOut) => {
+                                Some(he_return_code_t::HE_CONNECTION_TIMED_OUT)
+                            }
+                            Err(_) => Some(he_return_code_t::HE_ERR_FAILED),
                         }
-                        sync_conn_info(client);
+                    } else {
+                        None
                     }
+                };
+                if let Some(code) = tick_error {
+                    // The connection is disconnected/broken: do not run payload
+                    // retransmit ticks against it, and clear the stale nudge hint so
+                    // the caller's next he_conn_get_nudge_time() reports "no timer"
+                    // rather than a leftover deadline.
+                    client.conn.nudge_time_ms = 0;
+                    return Err(code);
                 }
+                sync_conn_info(client);
 
                 // Dispatch every due payload tick with its original TickType —
                 // these carry retransmit state Connection::tick() needs. This
