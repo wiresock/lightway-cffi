@@ -2,6 +2,7 @@
 name = "lightway-expresslane"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Pure-Rust ExpressLane data-packet encrypt/decrypt primitives, independent of lightway-core."
 license = "AGPL-3.0-only"
 repository = "https://github.com/expressvpn/lightway-cffi"

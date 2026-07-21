@@ -1786,6 +1786,26 @@ fn nudge_ms_until(deadline: Option<std::time::Instant>, now: std::time::Instant)
     deadline.map(|t| deadline_to_timeout_ms(t, now)).unwrap_or(0)
 }
 
+/// Translate a connection-tick failure and perform any required teardown.
+///
+/// Production callers must hold the per-client mutex (`he_conn_t::arc_lock`).
+/// Unit tests may instead pass an exclusively owned client with no callbacks.
+fn handle_connection_tick_error(
+    client: &mut he_client_t,
+    error: lightway_core::ConnectionError,
+) -> he_return_code_t {
+    if matches!(error, lightway_core::ConnectionError::TimedOut) {
+        // TimedOut is fatal. Clear the public timer before the disconnect
+        // callback can observe it, then drop the dead core connection so this
+        // client can reconnect.
+        client.conn.nudge_time_ms = 0;
+        fatal_disconnect(client);
+        he_return_code_t::HE_CONNECTION_TIMED_OUT
+    } else {
+        he_return_code_t::HE_ERR_FAILED
+    }
+}
+
 /// Nudge the connection — retransmit handshake messages if the keepalive
 /// timer has expired, and dispatch any due payload ticks (ExpressLane
 /// key-share retransmits, codec retransmits) with their original tick type.
@@ -1811,7 +1831,7 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 // lock. Payload timers get their own fresh decision time below,
                 // since this tick may run callbacks before they are examined.
                 let connection_tick_now = std::time::Instant::now();
-                {
+                let tick_error = {
                     let Some(ref mut connection) = client.connection else {
                         return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
                     };
@@ -1821,13 +1841,15 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                         .is_none_or(|t| connection_tick_now >= t);
                     if should_tick {
                         connection.app_state_mut().next_tick = None;
-                        match connection.tick(TickType::ConnectionTick) {
-                            Ok(()) => {}
-                            Err(_) => return Err(he_return_code_t::HE_ERR_FAILED),
-                        }
-                        sync_conn_info(client);
+                        connection.tick(TickType::ConnectionTick).err()
+                    } else {
+                        None
                     }
+                };
+                if let Some(error) = tick_error {
+                    return Err(handle_connection_tick_error(client, error));
                 }
+                sync_conn_info(client);
 
                 // Dispatch every due payload tick with its original TickType —
                 // these carry retransmit state Connection::tick() needs. This
@@ -2266,6 +2288,35 @@ mod tests {
 
             he_client_destroy(c);
         }
+    }
+
+    #[test]
+    fn connection_tick_timeout_clears_timer_and_disconnects_client() {
+        let mut client = he_client_t::new();
+        client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
+        client.conn.nudge_time_ms = 250;
+
+        let rc =
+            handle_connection_tick_error(&mut client, lightway_core::ConnectionError::TimedOut);
+
+        assert_eq!(rc, he_return_code_t::HE_CONNECTION_TIMED_OUT);
+        assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_DISCONNECTED);
+        assert_eq!(client.conn.nudge_time_ms, 0);
+        assert!(client.connection.is_none());
+    }
+
+    #[test]
+    fn non_timeout_connection_tick_error_preserves_client_timer() {
+        let mut client = he_client_t::new();
+        client.conn.state = he_conn_state_t::HE_STATE_CONNECTING;
+        client.conn.nudge_time_ms = 250;
+
+        let rc =
+            handle_connection_tick_error(&mut client, lightway_core::ConnectionError::InvalidState);
+
+        assert_eq!(rc, he_return_code_t::HE_ERR_FAILED);
+        assert_eq!(client.conn.state, he_conn_state_t::HE_STATE_CONNECTING);
+        assert_eq!(client.conn.nudge_time_ms, 250);
     }
 
     #[test]

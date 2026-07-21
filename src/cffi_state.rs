@@ -62,15 +62,14 @@ impl CffiAppState {
 ///
 /// Positive sub-millisecond durations must round up to 1 ms: callers use 0 to
 /// mean "no timer", so truncating a still-future deadline to 0 can make the
-/// host clear its wake-up before the tick is actually due.
+/// host clear its wake-up before the tick is actually due. Adding just under
+/// 1 ms before truncating rounds up while leaving an exact zero duration at 0;
+/// `saturating_add` avoids overflow on absurd inputs.
 pub(crate) fn duration_to_timeout_ms(duration: Duration) -> i32 {
-    let millis = duration.as_millis();
-    let rounded_up = if duration.subsec_nanos().is_multiple_of(1_000_000) {
-        millis
-    } else {
-        millis + 1
-    };
-    rounded_up.min(i32::MAX as u128) as i32
+    duration
+        .saturating_add(Duration::from_nanos(999_999))
+        .as_millis()
+        .min(i32::MAX as u128) as i32
 }
 
 /// Millisecond timeout for an outstanding deadline.

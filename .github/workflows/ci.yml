@@ -10,6 +10,28 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  msrv:
+    name: MSRV (Rust 1.91)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ubuntu-cargo-msrv-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ubuntu-cargo-
+
+      - name: Check workspace at MSRV
+        run: cargo check --workspace --all-targets --locked
+
   build-and-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

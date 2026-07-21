@@ -2,12 +2,17 @@
 name = "lightway-cffi"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "C ABI shim over lightway-core (Rust) for C/C++ consumers (e.g. kp_pkf_client)."
 license = "AGPL-3.0-only"
 repository = "https://github.com/expressvpn/lightway-cffi"
 
 [workspace]
 members = ["lightway-expresslane", "lightway-expresslane-cffi"]
+
+[workspace.package]
+# lightway-core uses Duration::from_mins, stabilized in Rust 1.91.
+rust-version = "1.91"
 
 [lib]
 # cdylib: lightway_cffi.dll + import lib for dynamic linking
