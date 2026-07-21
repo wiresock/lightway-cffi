@@ -46,6 +46,18 @@ pub(crate) struct CffiAppState {
     pub(crate) ctx: *mut c_void,
 }
 
+impl CffiAppState {
+    /// Earliest pending tick deadline across the `ConnectionTick` slot and the
+    /// payload ticks — the moment a single-timer host must wake for next.
+    pub(crate) fn earliest_tick_deadline(&self) -> Option<Instant> {
+        let pending = self.pending_ticks.iter().map(|(t, _)| *t).min();
+        match (self.next_tick, pending) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 impl Default for CffiAppState {
     fn default() -> Self {
         Self {
@@ -80,7 +92,8 @@ pub(crate) fn cffi_schedule_tick_cb(
     state: &mut CffiAppState,
     tick_type: lightway_core::TickType,
 ) {
-    let deadline = Instant::now() + d;
+    let now = Instant::now();
+    let deadline = now + d;
     match tick_type {
         // ConnectionTick is stateless, so deadlines can be merged: keep the
         // earliest pending one.
@@ -102,9 +115,20 @@ pub(crate) fn cffi_schedule_tick_cb(
     }
 
     // Notify the C caller so it can wake its nudge thread (e.g. signal
-    // nudge_event_ in the C++ lightway_tunnel nudge_thread).
+    // nudge_event_ in the C++ lightway_tunnel nudge_thread). The host keeps
+    // ONE timer and resets it to whatever timeout we pass, so it must always
+    // be told the time to the EARLIEST stored deadline — passing this call's
+    // own delay would let a later tick (e.g. a multi-second ConnectionTick)
+    // overwrite an earlier pending key-share/codec retransmit deadline and
+    // delay that retransmit by seconds.
     if let Some(cb) = state.nudge_time_cb {
-        let timeout_ms = d.as_millis().min(i32::MAX as u128) as i32;
+        // The deadline just inserted makes the state non-empty; unwrap_or is
+        // pure defensiveness.
+        let earliest = state.earliest_tick_deadline().unwrap_or(deadline);
+        let timeout_ms = earliest
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
         // SAFETY: conn_ptr and ctx are valid C pointers for the connection
         // lifetime; the C callback only uses them to look up its own state.
         unsafe { cb(state.conn_ptr, timeout_ms, state.ctx) };

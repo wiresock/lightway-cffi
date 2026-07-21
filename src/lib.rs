@@ -1627,7 +1627,7 @@ pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t)
                 // of overwriting the wake-up hint with a stale/zero value.
                 let now = std::time::Instant::now();
                 client.conn.nudge_time_ms =
-                    nudge_ms_until(earliest_tick_deadline(connection.app_state()), now);
+                    nudge_ms_until(connection.app_state().earliest_tick_deadline(), now);
                 Ok(())
             })
         } {
@@ -1780,18 +1780,6 @@ pub unsafe extern "C" fn he_conn_inside_packet_received(
     })
 }
 
-/// Earliest pending tick deadline across the `ConnectionTick` slot and the
-/// payload ticks. Drives `nudge_time_ms` so the C caller wakes for whichever
-/// timer fires first (a 500 ms key-share retransmit must not wait behind a
-/// multi-second connection tick).
-fn earliest_tick_deadline(state: &CffiAppState) -> Option<std::time::Instant> {
-    let pending = state.pending_ticks.iter().map(|(t, _)| *t).min();
-    match (state.next_tick, pending) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
 /// Remaining milliseconds from `now` until `deadline`, saturating; 0 when no
 /// deadline is pending.
 fn nudge_ms_until(deadline: Option<std::time::Instant>, now: std::time::Instant) -> i32 {
@@ -1874,7 +1862,7 @@ pub unsafe extern "C" fn he_conn_nudge(conn: *mut he_conn_t) -> he_return_code_t
                 let nudge_ms = client
                     .connection
                     .as_ref()
-                    .map(|c| nudge_ms_until(earliest_tick_deadline(c.app_state()), now))
+                    .map(|c| nudge_ms_until(c.app_state().earliest_tick_deadline(), now))
                     .unwrap_or(0);
                 client.conn.nudge_time_ms = nudge_ms;
                 Ok(())
@@ -2109,9 +2097,48 @@ mod tests {
 
         // The wake-up deadline is the earlier of the two — the 500 ms payload
         // tick, not the 10 s connection tick.
-        let earliest = earliest_tick_deadline(&state).expect("two deadlines pending");
+        let earliest = state.earliest_tick_deadline().expect("two deadlines pending");
         assert_eq!(earliest, state.pending_ticks[0].0);
         assert!(earliest < state.next_tick.expect("connection tick pending"));
+    }
+
+    #[test]
+    fn schedule_tick_cb_notifies_earliest_deadline() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static LAST_TIMEOUT_MS: AtomicI32 = AtomicI32::new(-1);
+        unsafe extern "C" fn capture(
+            _conn: *mut he_conn_t,
+            timeout: i32,
+            _context: *mut std::ffi::c_void,
+        ) -> he_return_code_t {
+            LAST_TIMEOUT_MS.store(timeout, Ordering::SeqCst);
+            he_return_code_t::HE_SUCCESS
+        }
+        let mut state = CffiAppState {
+            nudge_time_cb: Some(capture),
+            ..CffiAppState::default()
+        };
+
+        cffi_schedule_tick_cb(
+            std::time::Duration::from_millis(500),
+            &mut state,
+            TickType::PktCodecTick(1),
+        );
+        assert!((0..=500).contains(&LAST_TIMEOUT_MS.load(Ordering::SeqCst)));
+
+        // The C host keeps a single timer and resets it to every notified
+        // timeout, so scheduling a LATER tick must still notify the time to
+        // the earlier pending deadline — not this call's own 10 s delay.
+        cffi_schedule_tick_cb(
+            std::time::Duration::from_secs(10),
+            &mut state,
+            TickType::ConnectionTick,
+        );
+        let notified = LAST_TIMEOUT_MS.load(Ordering::SeqCst);
+        assert!(
+            (0..=500).contains(&notified),
+            "notified {notified} ms; expected the earlier (<= 500 ms) pending deadline"
+        );
     }
 
     #[test]
