@@ -1787,6 +1787,9 @@ fn nudge_ms_until(deadline: Option<std::time::Instant>, now: std::time::Instant)
 }
 
 /// Translate a connection-tick failure and perform any required teardown.
+///
+/// Production callers must hold the per-client mutex (`he_conn_t::arc_lock`).
+/// Unit tests may instead pass an exclusively owned client with no callbacks.
 fn handle_connection_tick_error(
     client: &mut he_client_t,
     error: lightway_core::ConnectionError,
