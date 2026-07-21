@@ -34,7 +34,8 @@ pub enum he_return_code_t {
     HE_ERR_PAYLOAD_TOO_LARGE = -7,
     /// String was not NUL-terminated or too long.
     HE_ERR_STRING_TOO_LONG = -8,
-    /// Connection timed out (used as a non-fatal nudge sentinel).
+    /// Connection timed out; the live connection is torn down and the client
+    /// may reconnect.
     HE_CONNECTION_TIMED_OUT = -9,
     /// An incorrect protocol version was received.
     HE_ERR_INCORRECT_PROTOCOL_VERSION = -10,
