@@ -1131,8 +1131,8 @@ he_return_code_t he_conn_build_expresslane_header(const he_client_t *client,
  if no connection is active yet, and `HE_SUCCESS` otherwise.
 
  # Safety
- `conn` must be null or a valid pointer to a `he_conn_t` whose `client_ptr`
- back-pointer was set by `he_client_t::new()` and has not been freed. Do not
+ `conn` must be null or a pointer obtained from `he_client_get_conn()` on a
+ client returned by `he_client_create()` that has not been destroyed. Do not
  call re-entrantly from within a callback that already holds the per-client
  lock.
  */

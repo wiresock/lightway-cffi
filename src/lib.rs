@@ -1585,8 +1585,8 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
 /// if no connection is active yet, and `HE_SUCCESS` otherwise.
 ///
 /// # Safety
-/// `conn` must be null or a valid pointer to a `he_conn_t` whose `client_ptr`
-/// back-pointer was set by `he_client_t::new()` and has not been freed. Do not
+/// `conn` must be null or a pointer obtained from `he_client_get_conn()` on a
+/// client returned by `he_client_create()` that has not been destroyed. Do not
 /// call re-entrantly from within a callback that already holds the per-client
 /// lock.
 #[unsafe(no_mangle)]
@@ -2017,6 +2017,23 @@ mod tests {
             assert_eq!(
                 he_conn_outside_data_received(conn, std::ptr::null_mut(), 0),
                 he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn expresslane_rotate_if_due_without_connection_is_rejected() {
+        unsafe {
+            assert_eq!(
+                he_conn_expresslane_rotate_if_due(std::ptr::null_mut()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            let c = he_client_create();
+            let conn = he_client_get_conn(c);
+            assert_eq!(
+                he_conn_expresslane_rotate_if_due(conn),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
             );
             he_client_destroy(c);
         }
