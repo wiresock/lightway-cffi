@@ -28,7 +28,7 @@ use bytes::BytesMut;
 use lightway_core::{
     AuthMethod, ClientContextBuilder, ConnectionType, DEFAULT_EXPRESSLANE_KEYS_ROTATION_INTERVAL,
     Header, OutsideIOSendCallbackArg, OutsidePacket, ProtocolVersion, RootCertificate, SessionId,
-    TickType,
+    State, TickType,
 };
 
 use cffi_expresslane::{CffiExpresslaneCb, CffiExpresslaneMetrics};
@@ -1556,6 +1556,77 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
     })
 }
 
+/// Rotate the ExpressLane send key if the rotation interval has elapsed.
+///
+/// `lightway-core` normally rotates the ExpressLane key off the back of
+/// outbound *inside* traffic (`Connection::inside_data_received`) and off an
+/// inbound peer `ExpresslaneConfig`. A data-plane offload bypasses
+/// `he_conn_inside_packet_received` for every ExpressLane packet, so on a
+/// long-lived, effectively one-directional offloaded egress flow neither
+/// trigger fires and the send key is never rotated past its interval. The
+/// always-on nudge/keepalive tick does not rotate either.
+///
+/// Call this once per nudge cycle (next to `he_conn_nudge`) to restore the
+/// interval-bounded rotation. It is internally gated by the connection's
+/// `time_to_rotate_key()` check, so it is a cheap no-op until the interval
+/// elapses and only rotates — sending a single `ExpresslaneConfig` frame —
+/// when actually due. A `degraded`/`not-supported` connection is treated as
+/// "nothing to rotate" and reported as success.
+///
+/// A connection in any state other than `Online` (before it, or after —
+/// disconnecting/disconnected) is also a success no-op; rotation only ever
+/// happens while `Online`. The pre-`Online` case is the one that matters in
+/// practice, because `he_conn_nudge` must also be driven during the handshake:
+/// with `last_key_rotation` still unset, a pre-`Online` call would otherwise
+/// burn the very first rotation on an `ExpresslaneConfig` the peer cannot
+/// receive yet, and the timestamp it sets would suppress the activation-time
+/// initial key share at `State::Online` for a full rotation interval — leaving
+/// the fast path without keys.
+///
+/// Returns:
+/// - `HE_ERR_NULL_POINTER` for a null `conn`.
+/// - `HE_ERR_INVALID_CONN_STATE` if no connection is active yet, or if called
+///   re-entrantly from within a callback that already holds the per-client lock.
+/// - `HE_SUCCESS` otherwise (including every no-op case above).
+///
+/// # Safety
+/// `conn` must be null or a pointer obtained from `he_client_get_conn()` on a
+/// client returned by `he_client_create()` that has not been destroyed. Do not
+/// call re-entrantly from within a callback that already holds the per-client
+/// lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t) -> he_return_code_t {
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        if conn.is_null() {
+            return he_return_code_t::HE_ERR_NULL_POINTER;
+        }
+        // SAFETY: conn is non-null (checked above) and carries the client
+        // back-pointer set by he_client_t::new(); with_client recovers and locks
+        // the owning client before handing out the &mut.
+        match unsafe {
+            with_client(conn, |client| -> Result<(), he_return_code_t> {
+                let Some(ref mut connection) = client.connection else {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                };
+                // Not Online (pre-handshake or tearing down): rotating now would
+                // consume the first time_to_rotate_key() pass on an unsendable
+                // config and suppress the activation-time initial key share (see
+                // doc comment). Treat as "not due yet", like any early wake-up.
+                if connection.state() != State::Online {
+                    return Ok(());
+                }
+                // Self-gated by time_to_rotate_key(); the only error it returns is
+                // "expresslane degraded", a benign no-op for a periodic caller.
+                let _ = connection.rotate_expresslane_key();
+                Ok(())
+            })
+        } {
+            Ok(Ok(())) => he_return_code_t::HE_SUCCESS,
+            Ok(Err(code)) | Err(code) => code,
+        }
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Data path
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1951,6 +2022,23 @@ mod tests {
             assert_eq!(
                 he_conn_outside_data_received(conn, std::ptr::null_mut(), 0),
                 he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            he_client_destroy(c);
+        }
+    }
+
+    #[test]
+    fn expresslane_rotate_if_due_without_connection_is_rejected() {
+        unsafe {
+            assert_eq!(
+                he_conn_expresslane_rotate_if_due(std::ptr::null_mut()),
+                he_return_code_t::HE_ERR_NULL_POINTER
+            );
+            let c = he_client_create();
+            let conn = he_client_get_conn(c);
+            assert_eq!(
+                he_conn_expresslane_rotate_if_due(conn),
+                he_return_code_t::HE_ERR_INVALID_CONN_STATE
             );
             he_client_destroy(c);
         }
