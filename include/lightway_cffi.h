@@ -1102,6 +1102,35 @@ he_return_code_t he_conn_build_expresslane_header(const he_client_t *client,
                                                   uint8_t *out);
 
 /*
+ Rotate the ExpressLane send key if the rotation interval has elapsed.
+
+ `lightway-core` normally rotates the ExpressLane key off the back of
+ outbound *inside* traffic (`Connection::inside_data_received`) and off an
+ inbound peer `ExpresslaneConfig`. A data-plane offload bypasses
+ `he_conn_inside_packet_received` for every ExpressLane packet, so on a
+ long-lived, effectively one-directional offloaded egress flow neither
+ trigger fires and the send key is never rotated past its interval. The
+ always-on nudge/keepalive tick does not rotate either.
+
+ Call this once per nudge cycle (next to `he_conn_nudge`) to restore the
+ interval-bounded rotation. It is internally gated by the connection's
+ `time_to_rotate_key()` check, so it is a cheap no-op until the interval
+ elapses and only rotates — sending a single `ExpresslaneConfig` frame —
+ when actually due. A `degraded`/`not-supported` connection is treated as
+ "nothing to rotate" and reported as success.
+
+ Returns `HE_ERR_NULL_POINTER` for a null `conn`, `HE_ERR_INVALID_CONN_STATE`
+ if no connection is active yet, and `HE_SUCCESS` otherwise.
+
+ # Safety
+ `conn` must be null or a valid pointer to a `he_conn_t` whose `client_ptr`
+ back-pointer was set by `he_client_t::new()` and has not been freed. Do not
+ call re-entrantly from within a callback that already holds the per-client
+ lock.
+ */
+he_return_code_t he_conn_expresslane_rotate_if_due(he_conn_t *conn);
+
+/*
  Feed an encrypted packet received from the wire into the connection.
 
  The decrypted inner payload will be returned via `inside_write_cb`.

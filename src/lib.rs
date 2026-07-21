@@ -1556,6 +1556,57 @@ pub unsafe extern "C" fn he_conn_build_expresslane_header(
     })
 }
 
+/// Rotate the ExpressLane send key if the rotation interval has elapsed.
+///
+/// `lightway-core` normally rotates the ExpressLane key off the back of
+/// outbound *inside* traffic (`Connection::inside_data_received`) and off an
+/// inbound peer `ExpresslaneConfig`. A data-plane offload bypasses
+/// `he_conn_inside_packet_received` for every ExpressLane packet, so on a
+/// long-lived, effectively one-directional offloaded egress flow neither
+/// trigger fires and the send key is never rotated past its interval. The
+/// always-on nudge/keepalive tick does not rotate either.
+///
+/// Call this once per nudge cycle (next to `he_conn_nudge`) to restore the
+/// interval-bounded rotation. It is internally gated by the connection's
+/// `time_to_rotate_key()` check, so it is a cheap no-op until the interval
+/// elapses and only rotates — sending a single `ExpresslaneConfig` frame —
+/// when actually due. A `degraded`/`not-supported` connection is treated as
+/// "nothing to rotate" and reported as success.
+///
+/// Returns `HE_ERR_NULL_POINTER` for a null `conn`, `HE_ERR_INVALID_CONN_STATE`
+/// if no connection is active yet, and `HE_SUCCESS` otherwise.
+///
+/// # Safety
+/// `conn` must be null or a valid pointer to a `he_conn_t` whose `client_ptr`
+/// back-pointer was set by `he_client_t::new()` and has not been freed. Do not
+/// call re-entrantly from within a callback that already holds the per-client
+/// lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn he_conn_expresslane_rotate_if_due(conn: *mut he_conn_t) -> he_return_code_t {
+    ffi_guard(he_return_code_t::HE_ERR_FAILED, || {
+        if conn.is_null() {
+            return he_return_code_t::HE_ERR_NULL_POINTER;
+        }
+        // SAFETY: conn is non-null (checked above) and carries the client
+        // back-pointer set by he_client_t::new(); with_client recovers and locks
+        // the owning client before handing out the &mut.
+        match unsafe {
+            with_client(conn, |client| -> Result<(), he_return_code_t> {
+                let Some(ref mut connection) = client.connection else {
+                    return Err(he_return_code_t::HE_ERR_INVALID_CONN_STATE);
+                };
+                // Self-gated by time_to_rotate_key(); the only error it returns is
+                // "expresslane degraded", a benign no-op for a periodic caller.
+                let _ = connection.rotate_expresslane_key();
+                Ok(())
+            })
+        } {
+            Ok(Ok(())) => he_return_code_t::HE_SUCCESS,
+            Ok(Err(code)) | Err(code) => code,
+        }
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Data path
 // ──────────────────────────────────────────────────────────────────────────────
