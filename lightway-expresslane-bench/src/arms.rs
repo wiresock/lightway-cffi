@@ -179,10 +179,12 @@ pub fn arm_ring_aesgcm_dec(c: &Ctx, s: &Src, dst: &mut [u8], sch: &Sched) -> (u6
     (black_box(acc), ok)
 }
 
-/// What a pure-Rust ChaCha20-Poly1305 costs. Reference point, not an option:
-/// BoringTun ships its own ChaCha rather than this crate, and on x86_64 with
-/// AES-NI the AES arm is the one that decides anything. Reported separately and
-/// never folded into the provider comparison.
+/// What a pure-Rust ChaCha20-Poly1305 costs. Reference point, not an option,
+/// and NOT a proxy for BoringTun: BoringTun's data plane uses ring's
+/// ChaCha20-Poly1305, so this arm is an UPPER BOUND on that primitive's cost,
+/// not an estimate of it. On x86_64 with AES-NI the AES arm is the one that
+/// decides anything. Reported separately and never folded into the provider
+/// comparison.
 #[inline(never)]
 pub fn arm_rc_chacha_dec(c: &Ctx, s: &Src, dst: &mut [u8], sch: &Sched) -> (u64, u64) {
     let (mut acc, mut ok) = (0u64, 0u64);

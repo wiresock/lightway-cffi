@@ -12,10 +12,12 @@ members = ["lightway-expresslane", "lightway-expresslane-cffi"]
 # Deliberately NOT a member. Cargo resolves the whole workspace even for the
 # `cargo rustc -p <pkg>` builds lightway-cffi.cmd runs, so a bench-only
 # dependency the build machine cannot fetch would fail the *shipping* build —
-# right after `cargo clean` has wiped the artifacts. It would also add `ring`
-# and friends to this Cargo.lock (which the MSRV `--locked` job consumes) and
-# CI's four `--workspace` jobs would build, test and clippy it. The bench is its
-# own workspace root with its own lock and its own target dir.
+# right after `cargo clean` has wiped the artifacts. It would also add the
+# bench-only providers — `aes-gcm`, `chacha20poly1305` and their RustCrypto
+# transitives; `ring` is already here as a lightway-expresslane dependency — to
+# this Cargo.lock, which the MSRV `--locked` job consumes, and CI's four
+# `--workspace` jobs would build, test and clippy it. The bench is its own
+# workspace root with its own lock and its own target dir.
 exclude = ["lightway-expresslane-bench"]
 
 [workspace.package]

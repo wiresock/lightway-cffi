@@ -3,7 +3,7 @@ name = "lightway-expresslane"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-description = "Pure-Rust ExpressLane data-packet encrypt/decrypt primitives, independent of lightway-core."
+description = "ExpressLane data-packet encrypt/decrypt primitives, independent of lightway-core."
 license = "AGPL-3.0-only"
 repository = "https://github.com/expressvpn/lightway-cffi"
 
@@ -16,9 +16,14 @@ missing_docs = "warn"
 
 [dependencies]
 # ring's fused AES-GCM assembly (AES-NI + PCLMULQDQ) replaces RustCrypto
-# aes-gcm: 1.00 c/B vs 3.11 c/B on the E-2286G rig, byte-identical on the wire
-# (the golden vectors in tests/wire_vectors.rs are the proof). Pinned to the
-# exact patch the benchmark measured, since the MSRV CI job builds `--locked`.
+# aes-gcm. On the E-2286G rig the AEAD-only cost (cold, payload copy subtracted)
+# fell from 3.11 to 1.00 c/B; those are DERIVED figures and their 3.11x quotient
+# is inflated — the RAW measured speedup, and the one to plan against, is 2.58x
+# (see doc/expresslane-performance-investigation.md in the consuming repo).
+# Byte-identical on the wire (the golden vectors in tests/wire_vectors.rs are
+# the proof). Held at the exact patch the benchmark measured by the committed
+# Cargo.lock, which the MSRV CI job consumes via `--locked`; the requirement
+# below is a caret range and does not by itself pin anything.
 # `default-features = false` drops `alloc` and `dev_urandom_fallback`; this
 # crate uses only the detached seal/open entry points, which need neither.
 ring = { version = "0.17.14", default-features = false }

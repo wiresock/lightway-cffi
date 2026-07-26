@@ -151,11 +151,18 @@ impl ReplayWindow {
         // excludes both endpoints). So the bit test alone already rejects that
         // case, and `>=` vs `>` is unobservable there.
         //
-        // The consequence is that this boundary has exactly ONE covering test:
-        // `rejects_counter_far_below_window_whose_slot_is_clear`. Change
-        // NUM_BLOCKS, BLOCK_BITS, or the RING_MASK derivation and the alias
-        // above may no longer hold; weaken or reorder this check without that
-        // test and an ancient counter whose slot happens to be clear is
+        // The consequence is that this boundary can only be exercised at age
+        // STRICTLY GREATER than WINDOW_SIZE, with the counter's slot clear.
+        // Three tests isolate it that way:
+        //   rejects_counter_far_below_window_whose_slot_is_clear   (counter 3000)
+        //   maximal_partial_clear_preserves_oldest_in_window_bit   (counter 59)
+        //   jump_of_exactly_window_size_invalidates_everything     (counter 8190)
+        // Deleting this check fails those three plus rejects_too_old_packets,
+        // handles_large_jumps, window_stalls_after_u64_wraparound_matching_
+        // todays_behaviour and both differential tests — eight in all, verified
+        // by mutation. Change NUM_BLOCKS, BLOCK_BITS, or the RING_MASK
+        // derivation and the alias above may no longer hold; weaken or reorder
+        // this check and an ancient counter whose slot happens to be clear is
         // accepted as fresh.
         if age >= Self::WINDOW_SIZE {
             return false;
@@ -407,7 +414,8 @@ mod tests {
         let mut window = ReplayWindow::default();
         assert!(window.commit(100));
         assert!(window.commit(10000)); // advance window past 8192
-        // 10000 - 8192 = 1808, so 1808 is the oldest still-in-window counter.
+        // 10000 - 8192 = 1808, which is age exactly WINDOW_SIZE and so one
+        // counter too old; 1809 is the oldest still in window.
         assert!(!window.commit(100));
         assert!(!window.commit(1808));
         assert!(window.commit(1809));
@@ -673,8 +681,11 @@ mod tests {
 
     /// Compare the two implementations' bitmaps semantically — the layouts
     /// differ, so the arrays cannot be compared directly. Walks the whole
-    /// window so a stale bit is caught at the step it appears, not thousands of
-    /// packets later when it finally becomes observable.
+    /// window, so a stale bit is caught at the next comparison rather than
+    /// thousands of packets later when it finally changes an accept/reject
+    /// decision. Called every 1000 steps and once at the end, so the step named
+    /// in `context` is where the divergence was *observed*, not necessarily
+    /// where it was introduced.
     fn assert_bitmaps_agree(
         reference: &ReferenceReplayWindow,
         fresh: &ReplayWindow,

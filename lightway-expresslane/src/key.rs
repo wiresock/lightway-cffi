@@ -5,15 +5,22 @@ pub const EXPRESSLANE_KEY_SIZE: usize = 32;
 
 /// An ExpressLane AES-256-GCM key.
 ///
-/// `Debug` is deliberately redacted so key material never lands in logs.
+/// `Debug` is deliberately redacted: formatting an `ExpresslaneKey` never emits
+/// key bytes, which closes the usual accidental-`{:?}` path. `.0` is `pub`, so
+/// this is a guard, not access control.
 ///
 /// The expanded key schedule inside [`crate::cipher::Cipher`] is **not**
 /// scrubbed on drop: `ring` makes no such guarantee, and neither did the
 /// `aes-gcm` `zeroize` feature this crate used to enable — that only scrubbed a
 /// temporary GHASH subkey inside the constructor, never the schedule and never
 /// on drop. Real scrubbing needs a guarded allocation and is its own piece of
-/// work. What IS scrubbed is the raw 32-byte key crossing the FFI boundary, via
-/// `zeroize::Zeroizing` in `lightway-expresslane-cffi`'s `set_key_from_ptr`.
+/// work. What IS scrubbed is exactly one copy: the `zeroize::Zeroizing` staging
+/// buffer that `lightway-expresslane-cffi`'s `set_key_from_ptr` reads the
+/// caller's bytes into. The `ExpresslaneKey` built from that buffer is `Copy`
+/// and travels by value down to `Cipher::new`, so further unscrubbed copies of
+/// the same 32 bytes sit on the stack for the duration of the install, and the
+/// caller's own buffer behind the `*const u8` is never touched at all.
+/// Containing those copies needs the same guarded allocation as the schedule.
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
 pub struct ExpresslaneKey(pub [u8; EXPRESSLANE_KEY_SIZE]);
 

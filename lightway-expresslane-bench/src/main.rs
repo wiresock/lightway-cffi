@@ -19,7 +19,7 @@
 //! - **Layer A** — the raw primitive: `aes-gcm` 0.10 (the incumbent), `ring`'s
 //!   AES-256-GCM (the candidate), and RustCrypto ChaCha20-Poly1305 (a reference
 //!   point for what BoringTun's primitive family costs), all decrypting the
-//!   *same* production wire packets with the same 12-byte nonce, the same
+//!   *same* production-format wire packets with the same 12-byte nonce, the same
 //!   18-byte Version2 AAD and the same detached 16-byte tag, in both
 //!   directions.
 //! - **Layer B** — `ExpresslaneSession::decrypt`/`::encrypt` from the real
@@ -1223,8 +1223,9 @@ fn print_report(
     println!("3. session overhead is a lump and cannot be split without editing the shipping");
     println!("   crate.");
     println!("4. The ChaCha arm is a different algorithm AND a different wire overhead; it is");
-    println!("   BoringTun context, not an ExpressLane option. BoringTun also ships its own");
-    println!("   ChaCha rather than this crate.");
+    println!("   context for BoringTun's primitive family, not an ExpressLane option - and it");
+    println!("   is an UPPER BOUND on BoringTun's cipher cost, not an estimate: BoringTun's");
+    println!("   data plane uses ring's ChaCha20-Poly1305, not this pure-Rust crate.");
     println!("5. Layer B is the only arm compiled exactly as shipped (real rlib). Layer A arms");
     println!("   inline the AEAD into this binary's own codegen unit — same optimizer settings,");
     println!("   but not the same compilation.");

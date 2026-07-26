@@ -15,7 +15,7 @@ This repo also contains
 independent C ABI for out-of-process ExpressLane data-packet encrypt/decrypt
 — e.g. for a Windows driver-adjacent process that needs packet crypto without
 linking this crate's full TLS/wolfssl-dependent client. It links only
-`lightway-expresslane`, a pure-Rust reimplementation of the ExpressLane
+`lightway-expresslane`, a reimplementation of the ExpressLane
 data-packet wire protocol, and ships as its own `lightway_expresslane_cffi`
 library with its own header.
 

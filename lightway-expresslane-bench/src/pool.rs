@@ -1,8 +1,10 @@
 //! Packet pools and the per-iteration schedule.
 //!
-//! Every arm decrypts *real* ExpressLane wire packets, produced by
-//! `ExpresslaneSession::encrypt` itself — not synthetic buffers. That matters
-//! for three reasons:
+//! Every arm decrypts genuine ExpressLane wire packets, produced by
+//! `ExpresslaneSession::encrypt` itself — the real wire format, not hand-rolled
+//! buffers. (The payloads themselves are deterministic PRNG output, and the
+//! traffic *shape* is not production's — see the schedule note below.) That
+//! matters for three reasons:
 //!
 //! - **The failure path is cheaper than the success path.** RustCrypto skips
 //!   applying the keystream when the tag check fails, so an arm that
@@ -141,7 +143,10 @@ impl Src {
             let iv = iv_for(counter);
 
             // AES arm: produced by the shipping encrypt, so the pool is by
-            // construction exactly what the production RX path sees.
+            // construction wire-format-identical to what the production RX path
+            // parses. The traffic *shape* is not production's: one payload
+            // size, counters strictly in order (so the replay window always
+            // takes the in-order commit path), flags always 0, Version2 only.
             let n = tx
                 .encrypt(
                     counter,
