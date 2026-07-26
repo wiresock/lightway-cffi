@@ -1,0 +1,65 @@
+[package]
+name = "lightway-expresslane-bench"
+version = "0.1.0"
+edition = "2024"
+# Cannot inherit from the outer [workspace.package]: this crate is deliberately
+# excluded from that workspace (see below), so the value is repeated here.
+rust-version = "1.91"
+description = "M3: measures what the ExpressLane AEAD actually costs, on the rig."
+license = "AGPL-3.0-only"
+publish = false
+
+# Its own workspace root. The bench must NOT join the outer workspace: cargo
+# resolves the whole workspace even for `cargo rustc -p <pkg>` builds, so a
+# bench-only dependency that a build machine cannot fetch would fail the
+# *shipping* build (lightway-cffi.cmd runs `cargo clean` first, so that failure
+# lands with no artifacts on disk). It would also drag `ring` into the shipping
+# Cargo.lock that the MSRV `--locked` job consumes, and the submodule CI's four
+# `--workspace` jobs would build, test and clippy it. The outer manifest also
+# lists this directory under [workspace] exclude, which documents the intent.
+[workspace]
+
+[[bin]]
+name = "m3-aead"
+path = "src/main.rs"
+
+[dependencies]
+# The real shipping crate, so Layer B measures the code that actually runs.
+lightway-expresslane = { path = "../lightway-expresslane" }
+
+# Byte-identical declaration to lightway-expresslane/Cargo.toml. If this ever
+# drifts, the incumbent is measured under codegen the shipping build never uses
+# and the whole comparison is void.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
+
+# The leading candidate. `default-features = false` drops `alloc` and the
+# dev_urandom fallback; the detached seal/open entry points do not need either.
+# ring ships pre-assembled .o files for x86_64-msvc, so NASM/Perl are not
+# invoked for a crates.io build - only a C compiler.
+ring = { version = "0.17", default-features = false }
+
+# What BoringTun authenticates with. 0.10.x deliberately: it shares aead 0.5.2
+# with aes-gcm 0.10, so both RustCrypto arms make a byte-identical call.
+# Reference point only - BoringTun ships its own ChaCha, not this crate.
+chacha20poly1305 = { version = "0.10", default-features = false }
+
+# Cargo's release defaults, written out rather than assumed, because "matches
+# the shipping profile" is the reason M3's numbers are subtractable from M1's.
+# The outer workspace has no [profile.release] section and lightway-cffi.cmd
+# sets no RUSTFLAGS, so this is exactly what the shipping static libs get.
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+debug-assertions = false
+overflow-checks = false
+panic = "unwind"
+incremental = false
+
+# Secondary profile only, for the "is the provider ranking profile-sensitive?"
+# question. BoringTun ships lto=true/cgu=1 and Lightway CFFI does not, so a
+# ranking that flips under LTO is itself a plan-relevant result.
+[profile.lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

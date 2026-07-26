@@ -1,0 +1,3 @@
+# The root .gitignore's `/target` is anchored to the repo root and does not
+# reach this excluded workspace's own target directory.
+/target
