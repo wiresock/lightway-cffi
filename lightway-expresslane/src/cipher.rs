@@ -39,7 +39,7 @@ impl Cipher {
             .0
             .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*iv), Aad::from(aad), buf)
             .map_err(|_| ExpresslaneError::InvalidData)?;
-        // Every AEAD ring exposes uses a 128-bit tag, so this cannot fail;
+        // Every AEAD that ring exposes uses a 128-bit tag, so this cannot fail;
         // expressing it as a fallible conversion rather than `copy_from_slice`
         // keeps a potential panic out of the packet path.
         tag.as_ref()

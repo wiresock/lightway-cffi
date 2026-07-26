@@ -58,14 +58,36 @@ const THREAD_PRIORITY_HIGHEST: i32 = 2;
 /// this — not 0 — is the documented "clear the ideal processor" value.
 const MAXIMUM_PROCESSORS: u32 = 64;
 
+/// Abort on a failed measurement primitive.
+///
+/// The scheduling calls below (affinity, ideal processor, priority) are
+/// best-effort tuning and are allowed to fail — the report states what actually
+/// took effect. The *measurement* primitives are not: every one of them returns
+/// a plausible-looking zero on failure, which would silently become a zero cycle
+/// delta, a zero elapsed time, or an effective GHz of nothing. A benchmark whose
+/// entire purpose is to keep a performance decision honest must not be able to
+/// report a fabricated number, so these abort instead.
+///
+/// `#[cold]` and out of line so the check stays a predictably-not-taken branch;
+/// `cycles()` runs twice per sample and its cost is itself measured and reported.
+#[cold]
+#[inline(never)]
+fn win32_failed(api: &str) -> ! {
+    panic!(
+        "{api} failed (GetLastError not captured). Every measurement this run \
+         would produce is meaningless, so it is aborted rather than reported."
+    );
+}
+
 /// CPU cycles actually consumed by this thread. The measurement primitive.
 #[inline]
 pub fn cycles() -> u64 {
     let mut c = 0u64;
     // SAFETY: both arguments are valid; GetCurrentThread returns a pseudo-handle
     // that needs no cleanup.
-    unsafe {
-        QueryThreadCycleTime(GetCurrentThread(), &mut c);
+    let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+    if ok == 0 {
+        win32_failed("QueryThreadCycleTime");
     }
     c
 }
@@ -88,8 +110,9 @@ pub fn cpu_100ns() -> u64 {
         FileTime::default(),
     );
     // SAFETY: four valid out-pointers, pseudo-handle needs no cleanup.
-    unsafe {
-        GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u);
+    let ok = unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 {
+        win32_failed("GetThreadTimes");
     }
     k.as_100ns() + u.as_100ns()
 }
@@ -101,19 +124,24 @@ pub fn cpu_100ns() -> u64 {
 pub fn qpc() -> i64 {
     let mut v = 0i64;
     // SAFETY: valid out-pointer.
-    unsafe {
-        QueryPerformanceCounter(&mut v);
+    let ok = unsafe { QueryPerformanceCounter(&mut v) };
+    if ok == 0 {
+        win32_failed("QueryPerformanceCounter");
     }
     v
 }
 
 pub fn qpc_freq() -> i64 {
-    let mut v = 1i64;
+    let mut v = 0i64;
     // SAFETY: valid out-pointer.
-    unsafe {
-        QueryPerformanceFrequency(&mut v);
+    let ok = unsafe { QueryPerformanceFrequency(&mut v) };
+    // A zero frequency would divide into an infinite wall time and silently
+    // disable the preemption detector, so treat it exactly like a failed call
+    // rather than substituting 1 and carrying on.
+    if ok == 0 || v <= 0 {
+        win32_failed("QueryPerformanceFrequency");
     }
-    if v == 0 { 1 } else { v }
+    v
 }
 
 /// System-wide (idle, kernel, user) CPU time in 100 ns units, for the
@@ -125,8 +153,9 @@ pub fn system_times() -> (u64, u64, u64) {
         FileTime::default(),
     );
     // SAFETY: three valid out-pointers.
-    unsafe {
-        GetSystemTimes(&mut i, &mut k, &mut u);
+    let ok = unsafe { GetSystemTimes(&mut i, &mut k, &mut u) };
+    if ok == 0 {
+        win32_failed("GetSystemTimes");
     }
     // GetSystemTimes' `kernel` figure INCLUDES idle, so busy = (k - i) + u.
     (i.as_100ns(), k.as_100ns(), u.as_100ns())

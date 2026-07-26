@@ -49,6 +49,19 @@
 //! hardware AES not detected, effective GHz far from M1's, or per-arm spread
 //! above 5%. See `doc/perf-m3-aead.md`.
 
+// Reading real consumed cycles means `QueryThreadCycleTime` from kernel32, and
+// interpreting the result means x86 CPUID for the cache geometry and the AES-NI
+// gate. Neither has a portable substitute, and there is no useful degraded mode:
+// a build that silently dropped either would emit numbers that cannot be
+// compared against M1's 7.66 c/B, which is the only reason this binary exists.
+// Fail here with a reason rather than deeper with a wall of link errors.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+compile_error!(
+    "lightway-expresslane-bench targets x86_64 Windows only: it measures with \
+     QueryThreadCycleTime (kernel32) and reads cache geometry and the AES-NI \
+     feature bits via x86 CPUID. Build it with --target x86_64-pc-windows-msvc."
+);
+
 mod arms;
 mod cpu;
 mod pool;
