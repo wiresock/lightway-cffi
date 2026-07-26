@@ -256,16 +256,32 @@ impl ExpresslaneSession {
     /// that holds `rx` across its whole AEAD — a cross-direction coupling that
     /// gets worse as the inbound rate rises.
     ///
-    /// The two flags are EXACT, not approximate: `current_self` is written only
-    /// by `promote_self_key` and `current_peer` only by `update_peer_key`, and
-    /// neither ever transitions back to `None`, so the mirrors are monotonic in
-    /// lockstep with the `Option`s they track.
+    /// What the flags guarantee is MONOTONICITY, not simultaneity. Each is
+    /// written exactly once, `false` -> `true`, by the sole writer of the
+    /// `Option` it tracks (`promote_self_key` for `current_self`,
+    /// `update_peer_key` for `current_peer`), and neither `Option` ever returns
+    /// to `None`. So a `true` answer can never become `false` again.
     ///
-    /// `Relaxed` is sufficient because nothing is *published* through these
-    /// flags: no caller reads cipher state via the answer. `encrypt` and
-    /// `decrypt` take their own locks and re-check `Option::is_some`
-    /// themselves, and both fail closed with `KeyNotSet`. The answer was
-    /// already stale the instant the old implementation released the lock.
+    /// They are NOT in lockstep with those `Option`s, and must not be described
+    /// as such: this reads both flags without taking either lock, so it sees two
+    /// independent `Relaxed` writes. A caller can therefore observe `false`
+    /// briefly after a key really is installed. That is harmless — the TX path
+    /// simply does not take the fast path for that packet — and it is the only
+    /// direction that can happen in practice.
+    ///
+    /// The dangerous direction, a `true` answer with no usable key, cannot
+    /// mislead anyone: `encrypt` and `decrypt` re-check `Option::is_some` under
+    /// their own locks and fail closed with `KeyNotSet`. This is a hint that
+    /// selects a path, never a fact anything relies on.
+    ///
+    /// `Relaxed` is therefore deliberate, and upgrading to `Release`/`Acquire`
+    /// would be worse than useless: nothing is published through these flags,
+    /// the `Option`s are only ever read under a lock whose acquire already
+    /// synchronizes-with the write side, and advertising a publication
+    /// guarantee would invite a future caller to read cipher state on the flag
+    /// alone — which is exactly the thing that is not safe. Note also that the
+    /// answer was already stale the instant the previous lock-taking
+    /// implementation released the lock.
     pub fn has_valid_keys(&self) -> bool {
         self.peer_key_installed.load(Ordering::Relaxed)
             && self.self_key_installed.load(Ordering::Relaxed)
