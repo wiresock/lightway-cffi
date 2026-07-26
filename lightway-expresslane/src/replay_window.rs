@@ -12,8 +12,15 @@
 /// in-order packet that makes up ~99% of traffic — whereas under absolute
 /// indexing advancing the window moves no bits at all; it only makes some
 /// slots stale, and only the slots of counters that were actually skipped
-/// need clearing. Advance is therefore `O(min(jump, NUM_BLOCKS))` instead of
-/// an unconditional `O(NUM_BLOCKS)`, and the common case is O(1).
+/// need clearing.
+///
+/// Advance is therefore `O(min(jump / BLOCK_BITS, NUM_BLOCKS))` instead of an
+/// unconditional `O(NUM_BLOCKS)`. The unit is WORDS, not counters, and the
+/// distinction is the whole point: `clear_range` clears whole 64-bit words, so
+/// a 100-counter jump costs about two word writes rather than a hundred bit
+/// operations. Only a jump of at least `WINDOW_SIZE` reaches `NUM_BLOCKS`,
+/// where the wipe is unconditional. The `jump == 1` case that is ~99% of
+/// traffic clears nothing at all — see `commit`.
 ///
 /// RING ALIASING INVARIANT: a ring slot is shared by every counter congruent
 /// modulo `WINDOW_SIZE`, and is authoritative for exactly one of them — the
