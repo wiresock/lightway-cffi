@@ -69,8 +69,11 @@ pub struct ExpresslaneSession {
     rx: Mutex<RxState>,
 
     // Lock-free mirrors of "a self key / a peer key has been installed", read
-    // by `has_valid_keys`. See that method for why they are exact rather than
-    // approximate, and why `Relaxed` is sufficient.
+    // by `has_valid_keys`. Monotonic (`false` -> `true`, once, never back) but
+    // deliberately NOT in lockstep with the `Option`s above — they are a hint
+    // that selects a path, never a fact anything relies on. See that method for
+    // the full argument and for why `Relaxed` is the right ordering rather than
+    // a weakness to be upgraded away.
     self_key_installed: AtomicBool,
     peer_key_installed: AtomicBool,
 }

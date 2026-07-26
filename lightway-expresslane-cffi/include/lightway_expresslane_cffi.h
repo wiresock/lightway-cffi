@@ -221,10 +221,11 @@ he_expresslane_return_code_t he_expresslane_encrypt(const he_expresslane_session
  from before the peer's rotation. Returns
  `HE_EXPRESSLANE_ERR_INVALID_KEY` for an all-zero key.
 
- The receive-side calls (`he_expresslane_decrypt`, this function,
- `he_expresslane_has_valid_keys`, `he_expresslane_packets_received`) are
- serialized internally per session, so this is safe to call from any
- thread; concurrent RX calls simply take turns.
+ The lock-taking receive-side calls (`he_expresslane_decrypt`, this
+ function, `he_expresslane_packets_received`) are serialized internally per
+ session, so this is safe to call from any thread; concurrent RX calls simply
+ take turns. `he_expresslane_has_valid_keys` is no longer among them — it is
+ lock-free and never waits on this one.
 
  # Safety
  `session` must be a valid non-null pointer. `key` must point to 32
@@ -260,10 +261,12 @@ uint64_t he_expresslane_packets_received(const he_expresslane_session_t *session
  Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out` must
  have capacity for at least `wire_packet_len - he_expresslane_wire_overhead()`
  bytes. On success, `*out_len` is set to the plaintext length and
- `*is_encoded` to the packet's encoded flag. The receive-side calls
- (`he_expresslane_set_peer_key`, `he_expresslane_has_valid_keys`,
- `he_expresslane_packets_received` and this one) are serialized internally
- per session, so this is safe to call from any thread.
+ `*is_encoded` to the packet's encoded flag. The lock-taking receive-side
+ calls (`he_expresslane_set_peer_key`, `he_expresslane_packets_received` and
+ this one) are serialized internally per session, so this is safe to call
+ from any thread. `he_expresslane_has_valid_keys` is deliberately not among
+ them: it is lock-free, so a sender polling it per outbound packet does not
+ wait on an in-progress decrypt.
 
  # Safety
  `session` must be a valid non-null pointer. `session_id` must point to 8
