@@ -9,8 +9,8 @@ Lets out-of-process code — a Windows usermode service today, potentially a
 kernel-mode driver later — encrypt/decrypt individual ExpressLane data
 packets directly, without linking the full `Connection` / TLS / IO-loop
 machinery from `lightway-core`. Deliberately has no wolfssl/TLS dependency:
-it links only `lightway-expresslane`, a pure-Rust reimplementation of the
-ExpressLane data-packet wire protocol using the `aes-gcm` crate.
+it links only `lightway-expresslane`, a reimplementation of the ExpressLane
+data-packet wire protocol using `ring`'s AES-256-GCM.
 
 Key exchange and rotation timing stay in the full `lightway-cffi` client
 (`he_expresslane_cb_t` / `he_expresslane_state_change_cb_t`). This crate is
@@ -28,8 +28,10 @@ full design.
   `he_expresslane_encrypt`.
 - **RX domain** (serialized internally per session — safe to call from any
   thread; concurrent RX calls simply take turns): `he_expresslane_set_peer_key`,
-  `he_expresslane_has_valid_keys`, `he_expresslane_packets_received`,
-  `he_expresslane_decrypt`.
+  `he_expresslane_packets_received`, `he_expresslane_decrypt`.
+- `he_expresslane_has_valid_keys` — lock-free (relaxed atomic loads), safe from
+  any thread, never waits on an in-progress `he_expresslane_decrypt`. The answer
+  is a hint: it can read `false` briefly after a key is installed.
 - `he_expresslane_wire_overhead` — buffer sizing helper (40 bytes).
 
 All buffers are caller-owned: `he_expresslane_encrypt`/`he_expresslane_decrypt`

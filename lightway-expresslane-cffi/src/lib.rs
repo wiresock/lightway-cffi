@@ -103,12 +103,19 @@ pub unsafe extern "C" fn he_expresslane_reserve_counter(
 }
 
 /// Shared body for the key setters: read the 32-byte key, install it into
-/// `session` via `install`, scrubbing the stack copy so raw key material
-/// does not linger in reused stack memory (matching the sibling
-/// `lightway-cffi` crate's key-handling discipline). The copy lives in a
+/// `session` via `install`, scrubbing this crate's staging copy so raw key
+/// material does not linger in reused stack memory (matching the sibling
+/// `lightway-cffi` crate's key-handling discipline). That copy lives in a
 /// [`zeroize::Zeroizing`] wrapper, so it is scrubbed on drop even if the
 /// closure unwinds (e.g. a panic inside `install`), not just on the normal
 /// return path.
+///
+/// Scope, so the guarantee is not read wider than it is: the staging buffer is
+/// the ONE copy scrubbed here. `ExpresslaneKey` is `Copy`, so the value derived
+/// from it travels by value into the session and on to the cipher constructor,
+/// leaving further unscrubbed copies on the stack for the duration of the call;
+/// and the caller's own buffer behind `key` is never touched. See
+/// [`lightway_expresslane::ExpresslaneKey`].
 ///
 /// # Safety
 /// `session` and `key` are dereferenced only after the null checks; `key`
@@ -192,8 +199,10 @@ pub unsafe extern "C" fn he_expresslane_packets_sent(
 }
 
 /// Encrypt `plain_text` into ExpressLane wire format. Safe to call
-/// concurrently from multiple threads on the same session, provided each
-/// call uses a unique `counter` (see `he_expresslane_reserve_counter`).
+/// concurrently from multiple threads on the same session, provided each call
+/// uses a unique `counter` (see `he_expresslane_reserve_counter`) AND a unique
+/// `iv` — see the IV section below; a unique `counter` does not make the `iv`
+/// unique.
 ///
 /// `out` must have capacity for at least
 /// `he_expresslane_wire_overhead() + plain_text_len` bytes. On success,
@@ -291,10 +300,11 @@ pub unsafe extern "C" fn he_expresslane_encrypt(
 /// from before the peer's rotation. Returns
 /// `HE_EXPRESSLANE_ERR_INVALID_KEY` for an all-zero key.
 ///
-/// The receive-side calls (`he_expresslane_decrypt`, this function,
-/// `he_expresslane_has_valid_keys`, `he_expresslane_packets_received`) are
-/// serialized internally per session, so this is safe to call from any
-/// thread; concurrent RX calls simply take turns.
+/// The lock-taking receive-side calls (`he_expresslane_decrypt`, this
+/// function, `he_expresslane_packets_received`) are serialized internally per
+/// session, so this is safe to call from any thread; concurrent RX calls simply
+/// take turns. `he_expresslane_has_valid_keys` is deliberately not among them —
+/// it is lock-free and never waits on this one.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer. `key` must point to 32
@@ -308,8 +318,18 @@ pub unsafe extern "C" fn he_expresslane_set_peer_key(
 }
 
 /// True if both a self (send) key and a peer (receive) key are installed.
-/// Serialized internally with the other receive-side calls, so safe to call
-/// from any thread.
+///
+/// Lock-free: a pair of relaxed atomic loads, taking neither the receive-side
+/// mutex nor the send-side lock. Safe to call from any thread, and in
+/// particular safe to call per outbound packet without contending with an
+/// in-progress inbound `he_expresslane_decrypt`.
+///
+/// The answer is a hint, not a synchronized snapshot: because it takes no lock,
+/// a caller on another thread may see `false` for a moment after a key really
+/// is installed. It never goes back to `false` once it has read `true`. Treat
+/// `false` as "not yet, retry", never as "key delivery failed" —
+/// `he_expresslane_encrypt` / `he_expresslane_decrypt` re-check under their own
+/// locks and return `HE_EXPRESSLANE_ERR_KEY_NOT_SET` if a key really is missing.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer or null.
@@ -348,10 +368,12 @@ pub unsafe extern "C" fn he_expresslane_packets_received(
 /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out` must
 /// have capacity for at least `wire_packet_len - he_expresslane_wire_overhead()`
 /// bytes. On success, `*out_len` is set to the plaintext length and
-/// `*is_encoded` to the packet's encoded flag. The receive-side calls
-/// (`he_expresslane_set_peer_key`, `he_expresslane_has_valid_keys`,
-/// `he_expresslane_packets_received` and this one) are serialized internally
-/// per session, so this is safe to call from any thread.
+/// `*is_encoded` to the packet's encoded flag. The lock-taking receive-side
+/// calls (`he_expresslane_set_peer_key`, `he_expresslane_packets_received` and
+/// this one) are serialized internally per session, so this is safe to call
+/// from any thread. `he_expresslane_has_valid_keys` is deliberately not among
+/// them: it is lock-free, so a sender polling it per outbound packet does not
+/// wait on an in-progress decrypt.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer. `session_id` must point to 8

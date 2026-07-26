@@ -1,7 +1,7 @@
 //! ExpressLane packet session: key rotation state, replay window, and
 //! encrypt/decrypt.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::cipher::Cipher;
@@ -41,12 +41,19 @@ fn build_aad(
 /// window, and encrypt/decrypt.
 ///
 /// Every method takes `&self` and the session is `Sync`, so all methods are
-/// safe to call from any thread on a shared handle — see
+/// safe to call from any thread on a shared handle. The original rationale is
 /// `docs/superpowers/specs/2026-07-16-expresslane-data-cffi-design.md`'s
-/// "Parallel encrypt" section in the `lightway-cffi` repo for the rationale:
+/// "Parallel encrypt" section in the `lightway-cffi` repo — a dated design
+/// record, so read it for the reasoning and this doc for the current contract;
+/// it predates `has_valid_keys` becoming lock-free and still describes that
+/// call as taking the `rx` lock.
 ///
-/// - TX state (`current_self`, `next_self`, counters) is lock-free / read-lock
-///   only, so many threads `encrypt()` concurrently at full throughput.
+/// - The `encrypt()` path is read-lock-only on `current_self` plus relaxed
+///   atomics, so many threads encrypt concurrently at full throughput. Key
+///   installation is NOT lock-free: `update_next_self_key` and
+///   `promote_self_key` take the `next_self` mutex, and `promote_self_key`
+///   additionally takes the `current_self` write lock, which does briefly block
+///   encryptors.
 /// - RX state (`current_peer`, `prev_peer`, `replay_window`) is serialized as
 ///   a unit behind `rx`. The replay-window bitmap update is inherently
 ///   ordered and a single RX thread per session is the common case, so this
@@ -67,6 +74,15 @@ pub struct ExpresslaneSession {
 
     // RX state — serialized as a unit by this mutex.
     rx: Mutex<RxState>,
+
+    // Lock-free mirrors of "a self key / a peer key has been installed", read
+    // by `has_valid_keys`. Monotonic (only ever stored `true`, never back) but
+    // deliberately NOT in lockstep with the `Option`s above — they are a hint
+    // that selects a path, never a fact anything relies on. See that method for
+    // the full argument and for why `Relaxed` is the right ordering rather than
+    // a weakness to be upgraded away.
+    self_key_installed: AtomicBool,
+    peer_key_installed: AtomicBool,
 }
 
 /// Receive-side session state, serialized as a unit by `ExpresslaneSession::rx`.
@@ -94,16 +110,21 @@ impl ExpresslaneSession {
                 prev_peer: None,
                 replay_window: ReplayWindow::default(),
             }),
+            self_key_installed: AtomicBool::new(false),
+            peer_key_installed: AtomicBool::new(false),
         }
     }
 
     // ---- TX domain: safe to call concurrently from multiple threads. ----
 
-    /// Reserve a wire counter value guaranteed unique for this session
-    /// (lock-free atomic increment). Use the returned value as `counter`
-    /// in the next `encrypt()` call, unless the caller has its own
-    /// uniqueness guarantee across every thread encrypting on this
-    /// session.
+    /// Reserve a wire counter value for this session: a lock-free atomic
+    /// increment, so no two concurrent callers ever receive the same value.
+    /// The sequence repeats only after wrapping at `u64::MAX` — deliberate, see
+    /// the body and `reserve_counter_wraps_through_zero_without_panicking` — so
+    /// this is NOT a uniqueness guarantee a nonce may be derived from; see
+    /// `encrypt`'s IV contract. Use the returned value as `counter` in the next
+    /// `encrypt()` call, unless the caller has its own uniqueness guarantee
+    /// across every thread encrypting on this session.
     pub fn reserve_counter(&self) -> u64 {
         // Matches upstream lightway-core: first packet is counter 1, not 0.
         // `wrapping_add` avoids a debug-build overflow panic at u64::MAX; the
@@ -141,6 +162,9 @@ impl ExpresslaneSession {
         let mut next = self.next_self.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cipher) = next.take() {
             *self.current_self.write().unwrap_or_else(|e| e.into_inner()) = Some(cipher);
+            // Set inside the arm, so a promote with nothing staged stays the
+            // no-op it has always been.
+            self.self_key_installed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -216,8 +240,11 @@ impl ExpresslaneSession {
         Ok(needed)
     }
 
-    // ---- RX domain: serialized internally as a unit by `self.rx`; safe to
-    // call from any thread (concurrent RX calls simply take turns). ----
+    // ---- RX domain: `update_peer_key`, `packets_received` and `decrypt` take
+    // `self.rx` and are serialized as a unit; safe to call from any thread
+    // (concurrent RX calls simply take turns). `has_valid_keys` sits below with
+    // them for readability but is the exception — it takes no lock and reads TX
+    // state as well; see its doc. ----
 
     /// Install a new peer (receive) key. The previous peer key becomes the
     /// fallback used by `decrypt` for packets still in flight from before
@@ -232,24 +259,51 @@ impl ExpresslaneSession {
         let cipher = Cipher::new(&key)?;
         let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
         rx.prev_peer = rx.current_peer.replace(cipher);
+        self.peer_key_installed.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// True if both a self (send) key and a peer (receive) key are
     /// installed.
+    ///
+    /// Lock-free by design. The TX path calls this per outbound packet purely
+    /// to decide whether to use the fast path, and taking the `rx` mutex to
+    /// answer it made every outbound packet contend with an inbound `decrypt`
+    /// that holds `rx` across its whole AEAD — a cross-direction coupling that
+    /// gets worse as the inbound rate rises.
+    ///
+    /// What the flags guarantee is MONOTONICITY, not simultaneity. Each is only
+    /// ever stored `true` — never back to `false` — by the sole writer of the
+    /// `Option` it tracks (`promote_self_key` for `current_self`,
+    /// `update_peer_key` for `current_peer`), and neither `Option` ever returns
+    /// to `None`. The stores are idempotent and repeat on every rotation, so do
+    /// not hang first-install side effects off them; what holds is that the
+    /// value transitions at most once, so a `true` answer can never become
+    /// `false` again.
+    ///
+    /// They are NOT in lockstep with those `Option`s, and must not be described
+    /// as such: this reads both flags without taking either lock, so it sees two
+    /// independent `Relaxed` writes. A caller can therefore observe `false`
+    /// briefly after a key really is installed. That is harmless — the TX path
+    /// simply does not take the fast path for that packet — and it is the only
+    /// direction that can happen in practice.
+    ///
+    /// The dangerous direction, a `true` answer with no usable key, cannot
+    /// mislead anyone: `encrypt` and `decrypt` re-check `Option::is_some` under
+    /// their own locks and fail closed with `KeyNotSet`. This is a hint that
+    /// selects a path, never a fact anything relies on.
+    ///
+    /// `Relaxed` is therefore deliberate, and upgrading to `Release`/`Acquire`
+    /// would be worse than useless: nothing is published through these flags,
+    /// the `Option`s are only ever read under a lock whose acquire already
+    /// synchronizes-with the write side, and advertising a publication
+    /// guarantee would invite a future caller to read cipher state on the flag
+    /// alone — which is exactly the thing that is not safe. Note also that the
+    /// answer was already stale the instant the previous lock-taking
+    /// implementation released the lock.
     pub fn has_valid_keys(&self) -> bool {
-        let has_peer = self
-            .rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .current_peer
-            .is_some();
-        has_peer
-            && self
-                .current_self
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
+        self.peer_key_installed.load(Ordering::Relaxed)
+            && self.self_key_installed.load(Ordering::Relaxed)
     }
 
     /// Total number of packets successfully decrypted so far.
@@ -264,6 +318,18 @@ impl ExpresslaneSession {
     /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out`
     /// must have capacity for at least `wire_packet.len() - WIRE_OVERHEAD`
     /// bytes. Returns `(plaintext_len, is_encoded)`.
+    ///
+    /// On `Err`, `out` never retains unauthenticated or
+    /// authenticated-then-rejected plaintext. Precisely:
+    ///
+    /// - Every reject *before* the AEAD runs leaves `out` entirely untouched.
+    ///   Note these include cases where `data_len` is not usable as an index
+    ///   into `out` at all: it is read from the wire before being validated, so
+    ///   on `BufferTooSmall` it exceeds `out.len()`, and on the shortest
+    ///   `InsufficientData` path it has not been parsed yet.
+    /// - The two rejects *after* an AEAD attempt — `InvalidData` when no key
+    ///   authenticates, and `Replayed` on the post-commit check — explicitly
+    ///   zero `out[..data_len]`, which by that point is known to be in bounds.
     pub fn decrypt(
         &self,
         session_id: [u8; 8],
@@ -303,29 +369,67 @@ impl ExpresslaneSession {
 
         // Try the current peer key, then the previous one (rotation fallback).
         // The caller's `out` is written only from here on, so every error path
-        // above leaves it untouched; on authentication failure the cipher
-        // leaves `out` unchanged, so the fallback attempt sees the original
-        // ciphertext.
+        // above leaves it untouched.
+        //
+        // CONTRACT: a failed `Cipher::decrypt` leaves `out` holding UNSPECIFIED
+        // bytes — ring promises only "may have been overwritten in an
+        // unspecified way", which permits both scrambling them and leaving them
+        // exactly as they were. Because the ciphertext cannot be ASSUMED to have
+        // survived, each attempt must start from a fresh copy. Do NOT hoist this
+        // second copy out of the fallback arm: it is what keeps in-flight
+        // packets recoverable across a peer key rotation. This arm runs only
+        // when the current key already failed, so under ring 0.17.14 — which
+        // does zero the buffer — dropping the copy turns every rotation with
+        // packets still in flight into a burst of loss; a rotation with nothing
+        // in flight never reaches here. Sitting inside the arm, it also costs the
+        // steady-state path (current key succeeds) exactly nothing — one copy,
+        // one AEAD call, same as before.
         let decrypted = {
             let Some(current) = rx.current_peer.as_ref() else {
                 return Err(ExpresslaneError::KeyNotSet);
             };
-            out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
-            current
-                .decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
-                .is_ok()
+            let ciphertext = &wire_packet[40..40 + data_len];
+            let aad = &aad_buf[..aad_len];
+
+            out[..data_len].copy_from_slice(ciphertext);
+            current.decrypt(&iv, aad, &mut out[..data_len], &tag).is_ok()
                 || rx.prev_peer.as_ref().is_some_and(|prev| {
-                    prev.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
-                        .is_ok()
+                    out[..data_len].copy_from_slice(ciphertext);
+                    prev.decrypt(&iv, aad, &mut out[..data_len], &tag).is_ok()
                 })
         };
         if !decrypted {
+            // Scrub before returning: per the contract above `out` now holds
+            // bytes that are NOT the authenticated plaintext, and "unspecified"
+            // covers leaving the ciphertext there — do not lean on ring's
+            // zeroing to have removed it. This buffer crosses the FFI boundary
+            // to a C++ caller that reuses it across packets, so leave it
+            // deterministically clean. Only the drop path pays, and it just
+            // paid for up to two AEAD attempts.
+            //
+            // NOT BLACK-BOX TESTABLE, and deliberately kept anyway: ring 0.17.14
+            // already zeroes on authentication failure, so deleting this line
+            // leaves every test green. It guards the documented contract
+            // ("unspecified"), not the current implementation. Do not conclude
+            // from a green suite that it is dead code.
+            out[..data_len].fill(0);
             return Err(ExpresslaneError::InvalidData);
         }
 
         // Commit only after successful authentication, so a forged packet
         // cannot poison the replay window.
         if !rx.replay_window.commit(counter) {
+            // UNREACHABLE BY CONSTRUCTION, not a race: the `rx` guard taken
+            // above is held across both `would_reject` and this `commit`, and
+            // the two apply identical accept/reject rules to identical state, so
+            // a counter that passed the pre-check cannot be refused here. The
+            // arm exists so that decoupling them later — dropping the guard
+            // between the AEAD and the commit to shorten the critical section is
+            // the obvious future change — degrades to a scrubbed drop rather
+            // than to authenticated plaintext left in a buffer the caller
+            // reuses. Unlike the arm above, that plaintext is real, so keep the
+            // scrub if the arm ever does become reachable.
+            out[..data_len].fill(0);
             return Err(ExpresslaneError::Replayed);
         }
 
@@ -571,6 +675,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_decrypt_scrubs_out_without_overrunning_data_len() {
+        // Pins the post-AEAD half of `decrypt`'s documented post-condition: on
+        // the `InvalidData` return — the only one of the two post-AEAD rejects
+        // that is reachable, the other being the post-commit `Replayed` —
+        // `out[..data_len]` is zeroed and nothing past `data_len` is touched.
+        // The pre-AEAD rejects leave `out` entirely untouched instead and are
+        // covered by their own tests; see the post-condition on `decrypt`.
+        // Every other test allocates `out` as a fresh zero-filled Vec, so none
+        // of them can see this at all. Here `out` starts as 0xCC, which is what
+        // the C++ caller's per-packet-reused stack buffer looks like.
+        //
+        // What it does NOT do — verified by mutation, not assumed — is prove
+        // that `decrypt`'s own `fill(0)` is what zeroes the buffer: ring 0.17.14
+        // already zeroes on authentication failure, so this test passes with
+        // that line deleted. No black-box test can separate the two. It pins the
+        // contract the FFI caller depends on, whichever layer supplies it, and
+        // the sentinel one byte past `data_len` genuinely does catch a scrub
+        // that runs long. MTU-sized so the AEAD spans many blocks.
+        let plain_text = vec![0x5Au8; 1350];
+        let key_a = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
+        let key_b = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
+        let key_c = ExpresslaneKey([3u8; EXPRESSLANE_KEY_SIZE]);
+        let session_id = [7u8; 8];
+
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        sender.update_next_self_key(key_a).unwrap();
+        sender.promote_self_key();
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, &plain_text, iv_for(1), false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        // Arm 1: only the current peer key is installed, and it is the wrong one.
+        let no_prev = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        no_prev.update_peer_key(key_b).unwrap();
+
+        // Arm 2: current AND prev are both installed and both wrong, so the
+        // fallback runs and its re-copy is the last thing to touch `out`.
+        let with_prev = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        with_prev.update_peer_key(key_b).unwrap();
+        with_prev.update_peer_key(key_c).unwrap();
+
+        for receiver in [&no_prev, &with_prev] {
+            let mut out = vec![0xCCu8; plain_text.len() + 1];
+            assert_eq!(
+                receiver.decrypt(session_id, &wire, &mut out),
+                Err(ExpresslaneError::InvalidData)
+            );
+            assert!(
+                out[..plain_text.len()].iter().all(|&b| b == 0),
+                "a rejected packet must leave no plaintext-shaped bytes in `out`"
+            );
+            assert_eq!(out[plain_text.len()], 0xCC, "the scrub must not exceed data_len");
+        }
+
+        // The same buffer shape on the success path: plaintext exactly, sentinel
+        // intact — so the scrub cannot be "passing" by zeroing unconditionally.
+        let good = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        good.update_peer_key(key_a).unwrap();
+        let mut out = vec![0xCCu8; plain_text.len() + 1];
+        let (len, _) = good.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], &plain_text[..]);
+        assert_eq!(out[plain_text.len()], 0xCC);
+    }
+
+    #[test]
     fn cross_version_v1_to_v2_fails() {
         let sender = ExpresslaneSession::new(ExpresslaneVersion::Version1);
         let receiver = ExpresslaneSession::new(ExpresslaneVersion::Version2);
@@ -726,7 +895,16 @@ mod tests {
     }
 
     #[test]
-    fn promote_self_key_mid_stream_does_not_corrupt_in_flight_encrypt() {
+    fn promote_self_key_concurrent_with_encrypt_does_not_corrupt_packets() {
+        // The overlap is BEST-EFFORT, not asserted: the encryptor runs a fixed
+        // 200 iterations while the main thread sleeps 1 ms and then promotes,
+        // so on a fast box the loop can finish first and every packet is
+        // produced under `key_a`. The test still passes — the receiver holds
+        // both keys and cannot tell — so a green run is not evidence the
+        // rotation landed mid-stream. Making it evidence needs the encryptor to
+        // loop until the promote is signalled plus an assertion that both keys
+        // are represented; that is a functional change to the test, deliberately
+        // not made here. Do not read this name as a pinned interleaving.
         let key_a = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
         let key_b = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
         let tx = ExpresslaneSession::new(ExpresslaneVersion::Version2);
