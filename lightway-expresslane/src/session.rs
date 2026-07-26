@@ -1,7 +1,7 @@
 //! ExpressLane packet session: key rotation state, replay window, and
 //! encrypt/decrypt.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::cipher::Cipher;
@@ -67,6 +67,12 @@ pub struct ExpresslaneSession {
 
     // RX state — serialized as a unit by this mutex.
     rx: Mutex<RxState>,
+
+    // Lock-free mirrors of "a self key / a peer key has been installed", read
+    // by `has_valid_keys`. See that method for why they are exact rather than
+    // approximate, and why `Relaxed` is sufficient.
+    self_key_installed: AtomicBool,
+    peer_key_installed: AtomicBool,
 }
 
 /// Receive-side session state, serialized as a unit by `ExpresslaneSession::rx`.
@@ -94,6 +100,8 @@ impl ExpresslaneSession {
                 prev_peer: None,
                 replay_window: ReplayWindow::default(),
             }),
+            self_key_installed: AtomicBool::new(false),
+            peer_key_installed: AtomicBool::new(false),
         }
     }
 
@@ -141,6 +149,9 @@ impl ExpresslaneSession {
         let mut next = self.next_self.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cipher) = next.take() {
             *self.current_self.write().unwrap_or_else(|e| e.into_inner()) = Some(cipher);
+            // Set inside the arm, so a promote with nothing staged stays the
+            // no-op it has always been.
+            self.self_key_installed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -232,24 +243,32 @@ impl ExpresslaneSession {
         let cipher = Cipher::new(&key)?;
         let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
         rx.prev_peer = rx.current_peer.replace(cipher);
+        self.peer_key_installed.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// True if both a self (send) key and a peer (receive) key are
     /// installed.
+    ///
+    /// Lock-free by design. The TX path calls this per outbound packet purely
+    /// to decide whether to use the fast path, and taking the `rx` mutex to
+    /// answer it made every outbound packet contend with an inbound `decrypt`
+    /// that holds `rx` across its whole AEAD — a cross-direction coupling that
+    /// gets worse as the inbound rate rises.
+    ///
+    /// The two flags are EXACT, not approximate: `current_self` is written only
+    /// by `promote_self_key` and `current_peer` only by `update_peer_key`, and
+    /// neither ever transitions back to `None`, so the mirrors are monotonic in
+    /// lockstep with the `Option`s they track.
+    ///
+    /// `Relaxed` is sufficient because nothing is *published* through these
+    /// flags: no caller reads cipher state via the answer. `encrypt` and
+    /// `decrypt` take their own locks and re-check `Option::is_some`
+    /// themselves, and both fail closed with `KeyNotSet`. The answer was
+    /// already stale the instant the old implementation released the lock.
     pub fn has_valid_keys(&self) -> bool {
-        let has_peer = self
-            .rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .current_peer
-            .is_some();
-        has_peer
-            && self
-                .current_self
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
+        self.peer_key_installed.load(Ordering::Relaxed)
+            && self.self_key_installed.load(Ordering::Relaxed)
     }
 
     /// Total number of packets successfully decrypted so far.
@@ -264,6 +283,11 @@ impl ExpresslaneSession {
     /// Decrypt `wire_packet` (ExpressLane wire format) into `out`. `out`
     /// must have capacity for at least `wire_packet.len() - WIRE_OVERHEAD`
     /// bytes. Returns `(plaintext_len, is_encoded)`.
+    ///
+    /// On every `Err` return `out[..data_len]` is either untouched (all the
+    /// pre-AEAD rejects) or explicitly zeroed by this function (both post-AEAD
+    /// rejects); it never holds unauthenticated or authenticated-then-rejected
+    /// plaintext.
     pub fn decrypt(
         &self,
         session_id: [u8; 8],
@@ -303,29 +327,63 @@ impl ExpresslaneSession {
 
         // Try the current peer key, then the previous one (rotation fallback).
         // The caller's `out` is written only from here on, so every error path
-        // above leaves it untouched; on authentication failure the cipher
-        // leaves `out` unchanged, so the fallback attempt sees the original
-        // ciphertext.
+        // above leaves it untouched.
+        //
+        // INVARIANT: `Cipher::decrypt` leaves `out` holding UNSPECIFIED bytes
+        // when authentication fails — that is ring's documented contract (in
+        // 0.17.14 it happens to zero them, but do not depend on that). Whatever
+        // they are, they are no longer the ciphertext, so each attempt must
+        // start from a fresh copy. Do NOT hoist this second copy out of
+        // the fallback arm: it is what keeps in-flight packets recoverable
+        // across a peer key rotation, and dropping it silently turns every
+        // rotation into a burst of packet loss. Sitting inside the arm, it also
+        // costs the steady-state path (current key succeeds) exactly nothing —
+        // one copy, one AEAD call, same as before.
         let decrypted = {
             let Some(current) = rx.current_peer.as_ref() else {
                 return Err(ExpresslaneError::KeyNotSet);
             };
-            out[..data_len].copy_from_slice(&wire_packet[40..40 + data_len]);
-            current
-                .decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
-                .is_ok()
+            let ciphertext = &wire_packet[40..40 + data_len];
+            let aad = &aad_buf[..aad_len];
+
+            out[..data_len].copy_from_slice(ciphertext);
+            current.decrypt(&iv, aad, &mut out[..data_len], &tag).is_ok()
                 || rx.prev_peer.as_ref().is_some_and(|prev| {
-                    prev.decrypt(&iv, &aad_buf[..aad_len], &mut out[..data_len], &tag)
-                        .is_ok()
+                    out[..data_len].copy_from_slice(ciphertext);
+                    prev.decrypt(&iv, aad, &mut out[..data_len], &tag).is_ok()
                 })
         };
         if !decrypted {
+            // Scrub before returning: per the invariant above `out` now holds
+            // bytes that are NOT the authenticated plaintext, and ring's
+            // contract is "unspecified" — do not lean on its zeroing. This
+            // buffer crosses the FFI boundary to a C++ caller that reuses it
+            // across packets, so leave it deterministically clean. Only the
+            // drop path pays, and it just paid for up to two AEAD attempts.
+            //
+            // NOT BLACK-BOX TESTABLE, and deliberately kept anyway: ring 0.17.14
+            // already zeroes on authentication failure, so deleting this line
+            // leaves every test green. It guards the documented contract
+            // ("unspecified"), not the current implementation. Do not conclude
+            // from a green suite that it is dead code.
+            out[..data_len].fill(0);
             return Err(ExpresslaneError::InvalidData);
         }
 
         // Commit only after successful authentication, so a forged packet
         // cannot poison the replay window.
         if !rx.replay_window.commit(counter) {
+            // UNREACHABLE BY CONSTRUCTION, not a race: the `rx` guard taken
+            // above is held across both `would_reject` and this `commit`, and
+            // the two apply identical accept/reject rules to identical state, so
+            // a counter that passed the pre-check cannot be refused here. The
+            // arm exists so that decoupling them later — dropping the guard
+            // between the AEAD and the commit to shorten the critical section is
+            // the obvious future change — degrades to a scrubbed drop rather
+            // than to authenticated plaintext left in a buffer the caller
+            // reuses. Unlike the arm above, that plaintext is real, so keep the
+            // scrub if the arm ever does become reachable.
+            out[..data_len].fill(0);
             return Err(ExpresslaneError::Replayed);
         }
 
@@ -568,6 +626,67 @@ mod tests {
         let mut out = vec![0u8; plain_text.len()];
         let (len, _) = receiver.decrypt(session_id, &wire, &mut out).unwrap();
         assert_eq!(&out[..len], plain_text);
+    }
+
+    #[test]
+    fn failed_decrypt_scrubs_out_without_overrunning_data_len() {
+        // Pins `decrypt`'s documented post-condition: on an `Err` return
+        // `out[..data_len]` is zeroed and nothing past `data_len` is touched.
+        // Every other test allocates `out` as a fresh zero-filled Vec, so none
+        // of them can see this at all. Here `out` starts as 0xCC, which is what
+        // the C++ caller's per-packet-reused stack buffer looks like.
+        //
+        // What it does NOT do — verified by mutation, not assumed — is prove
+        // that `decrypt`'s own `fill(0)` is what zeroes the buffer: ring 0.17.14
+        // already zeroes on authentication failure, so this test passes with
+        // that line deleted. No black-box test can separate the two. It pins the
+        // contract the FFI caller depends on, whichever layer supplies it, and
+        // the sentinel one byte past `data_len` genuinely does catch a scrub
+        // that runs long. MTU-sized so the AEAD spans many blocks.
+        let plain_text = vec![0x5Au8; 1350];
+        let key_a = ExpresslaneKey([1u8; EXPRESSLANE_KEY_SIZE]);
+        let key_b = ExpresslaneKey([2u8; EXPRESSLANE_KEY_SIZE]);
+        let key_c = ExpresslaneKey([3u8; EXPRESSLANE_KEY_SIZE]);
+        let session_id = [7u8; 8];
+
+        let sender = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        sender.update_next_self_key(key_a).unwrap();
+        sender.promote_self_key();
+        let mut wire = vec![0u8; ExpresslaneSession::WIRE_OVERHEAD + plain_text.len()];
+        let n = sender.encrypt(1, session_id, &plain_text, iv_for(1), false, &mut wire).unwrap();
+        wire.truncate(n);
+
+        // Arm 1: only the current peer key is installed, and it is the wrong one.
+        let no_prev = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        no_prev.update_peer_key(key_b).unwrap();
+
+        // Arm 2: current AND prev are both installed and both wrong, so the
+        // fallback runs and its re-copy is the last thing to touch `out`.
+        let with_prev = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        with_prev.update_peer_key(key_b).unwrap();
+        with_prev.update_peer_key(key_c).unwrap();
+
+        for receiver in [&no_prev, &with_prev] {
+            let mut out = vec![0xCCu8; plain_text.len() + 1];
+            assert_eq!(
+                receiver.decrypt(session_id, &wire, &mut out),
+                Err(ExpresslaneError::InvalidData)
+            );
+            assert!(
+                out[..plain_text.len()].iter().all(|&b| b == 0),
+                "a rejected packet must leave no plaintext-shaped bytes in `out`"
+            );
+            assert_eq!(out[plain_text.len()], 0xCC, "the scrub must not exceed data_len");
+        }
+
+        // The same buffer shape on the success path: plaintext exactly, sentinel
+        // intact — so the scrub cannot be "passing" by zeroing unconditionally.
+        let good = ExpresslaneSession::new(ExpresslaneVersion::Version2);
+        good.update_peer_key(key_a).unwrap();
+        let mut out = vec![0xCCu8; plain_text.len() + 1];
+        let (len, _) = good.decrypt(session_id, &wire, &mut out).unwrap();
+        assert_eq!(&out[..len], &plain_text[..]);
+        assert_eq!(out[plain_text.len()], 0xCC);
     }
 
     #[test]

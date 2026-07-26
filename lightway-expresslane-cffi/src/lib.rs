@@ -308,8 +308,11 @@ pub unsafe extern "C" fn he_expresslane_set_peer_key(
 }
 
 /// True if both a self (send) key and a peer (receive) key are installed.
-/// Serialized internally with the other receive-side calls, so safe to call
-/// from any thread.
+///
+/// Lock-free: a pair of relaxed atomic loads, taking neither the receive-side
+/// mutex nor the send-side lock. Safe to call from any thread, and in
+/// particular safe to call per outbound packet without contending with an
+/// in-progress inbound `he_expresslane_decrypt`.
 ///
 /// # Safety
 /// `session` must be a valid non-null pointer or null.

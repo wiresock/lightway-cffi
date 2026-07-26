@@ -5,9 +5,15 @@ pub const EXPRESSLANE_KEY_SIZE: usize = 32;
 
 /// An ExpressLane AES-256-GCM key.
 ///
-/// `Debug` is deliberately redacted so key material never lands in logs; the
-/// expanded key schedule held by the loaded [`crate::cipher::Cipher`] is
-/// zeroized on drop via `aes-gcm`'s `zeroize` feature.
+/// `Debug` is deliberately redacted so key material never lands in logs.
+///
+/// The expanded key schedule inside [`crate::cipher::Cipher`] is **not**
+/// scrubbed on drop: `ring` makes no such guarantee, and neither did the
+/// `aes-gcm` `zeroize` feature this crate used to enable — that only scrubbed a
+/// temporary GHASH subkey inside the constructor, never the schedule and never
+/// on drop. Real scrubbing needs a guarded allocation and is its own piece of
+/// work. What IS scrubbed is the raw 32-byte key crossing the FFI boundary, via
+/// `zeroize::Zeroizing` in `lightway-expresslane-cffi`'s `set_key_from_ptr`.
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
 pub struct ExpresslaneKey(pub [u8; EXPRESSLANE_KEY_SIZE]);
 

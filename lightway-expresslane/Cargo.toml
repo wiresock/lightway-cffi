@@ -15,6 +15,10 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [dependencies]
-# `zeroize` scrubs the expanded AES key schedule from memory when a Cipher is
-# dropped (key rotation / session teardown).
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
+# ring's fused AES-GCM assembly (AES-NI + PCLMULQDQ) replaces RustCrypto
+# aes-gcm: 1.00 c/B vs 3.11 c/B on the E-2286G rig, byte-identical on the wire
+# (the golden vectors in tests/wire_vectors.rs are the proof). Pinned to the
+# exact patch the benchmark measured, since the MSRV CI job builds `--locked`.
+# `default-features = false` drops `alloc` and `dev_urandom_fallback`; this
+# crate uses only the detached seal/open entry points, which need neither.
+ring = { version = "0.17.14", default-features = false }
