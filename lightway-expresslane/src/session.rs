@@ -284,10 +284,17 @@ impl ExpresslaneSession {
     /// must have capacity for at least `wire_packet.len() - WIRE_OVERHEAD`
     /// bytes. Returns `(plaintext_len, is_encoded)`.
     ///
-    /// On every `Err` return `out[..data_len]` is either untouched (all the
-    /// pre-AEAD rejects) or explicitly zeroed by this function (both post-AEAD
-    /// rejects); it never holds unauthenticated or authenticated-then-rejected
-    /// plaintext.
+    /// On `Err`, `out` never retains unauthenticated or
+    /// authenticated-then-rejected plaintext. Precisely:
+    ///
+    /// - Every reject *before* the AEAD runs leaves `out` entirely untouched.
+    ///   Note these include cases where `data_len` is not usable as an index
+    ///   into `out` at all: it is read from the wire before being validated, so
+    ///   on `BufferTooSmall` it exceeds `out.len()`, and on the shortest
+    ///   `InsufficientData` path it has not been parsed yet.
+    /// - The two rejects *after* an AEAD attempt — `InvalidData` when no key
+    ///   authenticates, and `Replayed` on the post-commit check — explicitly
+    ///   zero `out[..data_len]`, which by that point is known to be in bounds.
     pub fn decrypt(
         &self,
         session_id: [u8; 8],

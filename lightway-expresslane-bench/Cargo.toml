@@ -27,21 +27,30 @@ path = "src/main.rs"
 # The real shipping crate, so Layer B measures the code that actually runs.
 lightway-expresslane = { path = "../lightway-expresslane" }
 
-# Byte-identical declaration to lightway-expresslane/Cargo.toml. If this ever
-# drifts, the incumbent is measured under codegen the shipping build never uses
-# and the whole comparison is void.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
+# Every version below is pinned to the exact patch the reported numbers were
+# measured against. A floating requirement would let a `cargo update` silently
+# re-resolve a provider and invalidate comparisons across runs and commits,
+# which is the one thing a benchmark used to justify a provider decision must
+# not do.
 
-# The leading candidate. `default-features = false` drops `alloc` and the
-# dev_urandom fallback; the detached seal/open entry points do not need either.
-# ring ships pre-assembled .o files for x86_64-msvc, so NASM/Perl are not
-# invoked for a crates.io build - only a C compiler.
-ring = { version = "0.17", default-features = false }
+# The INCUMBENT, and the reason this crate exists. This is byte-identical to the
+# declaration lightway-expresslane carried before the ring swap (fd393d5); the
+# shipping crate no longer depends on aes-gcm at all, so this is now the only
+# record of how the measured incumbent was built. Keep the feature set exactly
+# as it was: change it and the incumbent is measured under codegen the shipping
+# build never used, which voids the comparison rather than updating it.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "zeroize"] }
 
-# What BoringTun authenticates with. 0.10.x deliberately: it shares aead 0.5.2
-# with aes-gcm 0.10, so both RustCrypto arms make a byte-identical call.
-# Reference point only - BoringTun ships its own ChaCha, not this crate.
-chacha20poly1305 = { version = "0.10", default-features = false }
+# The candidate, matching lightway-expresslane's pin. `default-features = false`
+# drops `alloc` and the dev_urandom fallback; the detached seal/open entry
+# points need neither. ring ships pre-assembled .o files for x86_64-msvc, so
+# NASM/Perl are not invoked for a crates.io build - only a C compiler.
+ring = { version = "0.17.14", default-features = false }
+
+# What BoringTun authenticates with. The 0.10 line deliberately: it shares
+# aead 0.5.2 with aes-gcm 0.10, so both RustCrypto arms make a byte-identical
+# call. Reference point only - BoringTun ships its own ChaCha, not this crate.
+chacha20poly1305 = { version = "0.10.1", default-features = false }
 
 # Cargo's release defaults, written out rather than assumed, because "matches
 # the shipping profile" is the reason M3's numbers are subtractable from M1's.
